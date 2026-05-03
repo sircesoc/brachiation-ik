@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Willy Double-Parallelogram IK</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2028; --ink: #e6e9ef; --ink-dim: #8a96a8;
+    --accent: #5fb3ff; --accent-2: #ff9f5f; --good: #6fdc8c; --bad: #ff6b6b;
+    --grid: #232a35;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, sans-serif; color: var(--ink);
+         background: var(--bg); margin: 0; padding: 24px; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px 0; }
+  .subtitle { color: var(--ink-dim); font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 320px; gap: 20px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .stage { background: var(--panel); border-radius: 10px; overflow: hidden;
+           aspect-ratio: 1.2 / 1; min-height: 400px; }
+  svg { width: 100%; height: 100%; display: block; cursor: crosshair; }
+  .controls { background: var(--panel); border-radius: 10px; padding: 18px;
+              display: flex; flex-direction: column; gap: 16px; }
+  h3 { margin: 0 0 6px 0; font-size: 13px; font-weight: 600; }
+  .row { display: flex; flex-direction: column; gap: 5px; }
+  .lbl { display: flex; justify-content: space-between; font-size: 12px;
+         color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  .lbl b { color: var(--ink); font-weight: 500; }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; }
+  .modes, .branch { display: flex; gap: 6px; }
+  .modes button, .branch button {
+    flex: 1; background: var(--bg); color: var(--ink-dim);
+    border: 1px solid var(--grid); padding: 7px 8px; font-size: 12px;
+    border-radius: 5px; cursor: pointer; font-family: inherit;
+  }
+  .modes button.active { background: var(--accent); color: var(--bg);
+                         border-color: var(--accent); font-weight: 500; }
+  .branch button.active { background: var(--accent-2); color: var(--bg);
+                          border-color: var(--accent-2); font-weight: 500; }
+  .readout { background: var(--bg); padding: 12px; border-radius: 5px;
+             font-family: 'SF Mono', monospace; font-size: 11.5px;
+             line-height: 1.6; color: var(--ink-dim); }
+  .readout span { color: var(--ink); }
+  .readout .err { color: var(--bad); font-weight: 500; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px;
+            color: var(--ink-dim); }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-swatch { width: 14px; height: 3px; border-radius: 2px; }
+  .params { background: var(--bg); padding: 10px 12px; border-radius: 5px;
+            font-family: 'SF Mono', monospace; font-size: 11px;
+            color: var(--ink-dim); line-height: 1.5; }
+  .params span { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Willy double-parallelogram arm</h1>
+  <div class="subtitle">Motor 1 on base drives Comp139 · Motor 2 mounted on Comp139 at the elbow drives Comp146 directly · two passive parallelograms keep the wrist parallel to base</div>
+  <div class="grid">
+    <div class="stage">
+      <svg id="stage" viewBox="-70 -50 140 115" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <pattern id="g" width="5" height="5" patternUnits="userSpaceOnUse">
+            <path d="M 5 0 L 0 0 0 5" fill="none" stroke="#232a35" stroke-width="0.05"/>
+          </pattern>
+        </defs>
+        <rect x="-100" y="-100" width="200" height="200" fill="url(#g)"/>
+        <g id="workspace"></g>
+        <line x1="-100" y1="0" x2="100" y2="0" stroke="#232a35" stroke-width="0.1"/>
+        <line x1="0" y1="-100" x2="0" y2="100" stroke="#232a35" stroke-width="0.1"/>
+        <g id="linkage"></g>
+        <g id="target"></g>
+        <text id="m1-label-right" font-size="1.4" fill="#8a96a8" font-family="Menlo, monospace">M1</text>
+        <text id="m1-label-left" font-size="1.4" fill="#8a96a8" font-family="Menlo, monospace">M1</text>
+      </svg>
+    </div>
+
+    <div class="controls">
+      <div class="params">
+        <div>Upper arm <span>a = 9.78</span> cm</div>
+        <div>Forearm + wrist <span>L = 36.79</span> cm</div>
+        <div>α₁ = θ₁ + 27.96°  (shoulder absolute)</div>
+        <div>α₂ = θ₂ − 31.97°  (elbow relative)</div>
+      </div>
+
+      <div>
+        <h3>Mode</h3>
+        <div class="modes">
+          <button id="mode-fk" class="active">Forward (motors)</button>
+          <button id="mode-ik">Inverse (target)</button>
+        </div>
+      </div>
+
+      <div id="fk-controls">
+        <div class="row">
+          <div class="lbl"><span>θ₁ shoulder motor</span><b id="t1-val">0.0°</b></div>
+          <input type="range" id="t1" min="-90" max="90" step="0.5" value="0">
+        </div>
+        <div class="row">
+          <div class="lbl"><span>θ₂ elbow motor</span><b id="t2-val">0.0°</b></div>
+          <input type="range" id="t2" min="-150" max="150" step="0.5" value="0">
+        </div>
+      </div>
+
+      <div id="ik-controls" style="display:none">
+        <div class="row">
+          <div class="lbl"><span>target u (cm)</span><b id="u-val">38.5</b></div>
+          <input type="range" id="u" min="-50" max="50" step="0.1" value="38.5">
+        </div>
+        <div class="row">
+          <div class="lbl"><span>target v (cm)</span><b id="v-val">5</b></div>
+          <input type="range" id="v" min="-50" max="50" step="0.1" value="5">
+        </div>
+        <div class="row">
+          <h3 style="margin-top:6px">Elbow branch</h3>
+          <div class="branch">
+            <button id="elb-up" class="active">elbow up</button>
+            <button id="elb-dn">elbow down</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="readout" id="readout"></div>
+
+      <div class="legend">
+        <div class="legend-item"><div class="legend-swatch" style="background:#5fb3ff"></div>Comp139</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#b388ff"></div>Comp148 (passive)</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#d4a8ff"></div>Comp151</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#ff9f5f"></div>Comp146</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#ffc89f"></div>Comp147 (passive) / Comp143</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  const a = 9.778;
+  const L = 36.786;
+  const k1 = 27.963;
+  const k2 = -31.965;
+
+  const W_proximal = 7.62;   // perpendicular spacing between Comp139 and Comp148
+  const W_distal   = 7.62;   // perpendicular spacing between Comp146 and Comp147
+  const ForearmDrawLen = L - 7.62;  // length of Comp146 alone, before wrist plate
+
+  // Lateral spacing between the two arms' base pivots, along the u axis.
+  // 11.7055 in = 29.7320 cm.  Each arm sits at +/- HALF_BASE_SPACING from the v axis.
+  const HALF_BASE_SPACING = 11.7055 * 2.54 / 2;
+
+  const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+
+  function fk(t1, t2) {
+    const a1 = (t1 + k1) * D2R;
+    const a2 = (t2 + k2) * D2R;
+    const a12 = a1 + a2;
+    return { u: a*Math.cos(a1) + L*Math.cos(a12),
+             v: a*Math.sin(a1) + L*Math.sin(a12),
+             a1, a2, a12 };
+  }
+
+  function ik(u, v, elbow) {
+    const r2 = u*u + v*v, r = Math.sqrt(r2);
+    const rmin = Math.abs(a - L), rmax = a + L;
+    if (r > rmax - 1e-9 || r < rmin + 1e-9)
+      return { reachable: false, r, rmin, rmax };
+    let cosArg = (r2 - a*a - L*L) / (2*a*L);
+    cosArg = Math.max(-1, Math.min(1, cosArg));
+    const alpha2 = elbow === 'up' ? -Math.acos(cosArg) : Math.acos(cosArg);
+    const alpha1 = Math.atan2(v, u) - Math.atan2(L*Math.sin(alpha2), a + L*Math.cos(alpha2));
+    return { reachable: true,
+             t1: alpha1*R2D - k1, t2: alpha2*R2D - k2,
+             a1: alpha1, a2: alpha2 };
+  }
+
+  const svg = document.getElementById('stage');
+  const linkageG = document.getElementById('linkage');
+  const targetG = document.getElementById('target');
+  const workspaceG = document.getElementById('workspace');
+
+  const labelR = document.getElementById('m1-label-right');
+  labelR.setAttribute('x', HALF_BASE_SPACING + 0.8);
+  labelR.setAttribute('y', '-1');
+  const labelL = document.getElementById('m1-label-left');
+  labelL.setAttribute('x', -HALF_BASE_SPACING - 3.5);
+  labelL.setAttribute('y', '-1');
+
+  workspaceG.innerHTML = `
+    <circle cx="${HALF_BASE_SPACING}" cy="0" r="${a+L}" fill="rgba(95,179,255,0.04)"
+            stroke="#5fb3ff" stroke-width="0.1" stroke-dasharray="0.5 0.5" opacity="0.4"/>
+    <circle cx="${HALF_BASE_SPACING}" cy="0" r="${Math.abs(a-L)}" fill="#0f1419"
+            stroke="#5fb3ff" stroke-width="0.1" stroke-dasharray="0.5 0.5" opacity="0.4"/>
+    <circle cx="${-HALF_BASE_SPACING}" cy="0" r="${a+L}" fill="rgba(95,179,255,0.04)"
+            stroke="#5fb3ff" stroke-width="0.1" stroke-dasharray="0.5 0.5" opacity="0.4"/>
+    <circle cx="${-HALF_BASE_SPACING}" cy="0" r="${Math.abs(a-L)}" fill="#0f1419"
+            stroke="#5fb3ff" stroke-width="0.1" stroke-dasharray="0.5 0.5" opacity="0.4"/>`;
+
+  function drawLinkage(t1, t2, primary) {
+    const a1 = (t1 + k1) * D2R;
+    const a2 = (t2 + k2) * D2R;
+    const a12 = a1 + a2;
+
+    const sx = Math.cos(a1), sy = Math.sin(a1);
+    const spx = -sy, spy = sx;          // perpendicular to shoulder, +90 rot
+    const fx = Math.cos(a12), fy = Math.sin(a12);
+    const fpx = -fy, fpy = fx;          // perpendicular to forearm, +90 rot
+
+    // === Proximal parallelogram ===
+    // Comp139: M1 (0,0) -> elbow at distance a along shoulder direction
+    const elbowX = a * sx;
+    const elbowY = a * sy;
+
+    // Comp151 is a RIGID triangular plate. Its three corners have fixed
+    // pairwise distances. Because Comp151 is the coupler of the proximal
+    // parallelogram, and that parallelogram keeps the coupler parallel to
+    // the base in every configuration, Comp151 NEVER ROTATES in space --
+    // it only translates with the elbow.
+    //
+    // Corner offsets from the orange (elbow) corner, taken directly from
+    // the Fusion model (in cm, fixed in world coords because Comp151
+    // stays parallel to base):
+    //   distal corner (Comp147 attach) at (+7.62, 0)         -- ahead of elbow
+    //   purple corner (Comp148 attach) at (+7.62, -3.493)    -- ahead and below
+    //
+    // So the two passive-rod pins sit on opposite sides of the triangle:
+    // distal is on the forearm-side edge, purple is on the underside edge.
+    const Jorange_x = elbowX, Jorange_y = elbowY;
+    const Jdistal_x = Jorange_x + 7.62;
+    const Jdistal_y = Jorange_y + 0.0;
+    const Jpurple_x = Jorange_x + 7.62;
+    const Jpurple_y = Jorange_y - 3.493;
+
+    // Comp148 (passive parallel rod): goes from M2 base pivot to Jpurple.
+    // For the parallelogram to close, M2 must lie at Jpurple - a*(shoulder dir),
+    // i.e. M2's offset from M1 equals Jpurple's offset from elbow (which is fixed).
+    const M2x = Jpurple_x - elbowX;        // = 0
+    const M2y = Jpurple_y - elbowY;        // = -W_proximal
+    const C148end_x = Jpurple_x;
+    const C148end_y = Jpurple_y;
+
+    // === Distal parallelogram ===
+    // Comp146 (motor-2 driven forearm): elbow -> J4 along forearm direction
+    const J4x = elbowX + fx * ForearmDrawLen;
+    const J4y = elbowY + fy * ForearmDrawLen;
+    // Comp143 wrist plate stays parallel to base. The orange-distal edge of
+    // Comp151 has fixed offset (+7.62, 0) cm in world coords, so the distal
+    // parallelogram's coupler Comp143 has the same offset between its two pins:
+    //    J7 = J4 + (7.62, 0)
+    const J7x = J4x + 7.62;
+    const J7y = J4y;
+    // Comp147 (passive parallel rod): from Jdistal to J7. By construction,
+    // Jdistal -> J7 has the same length and direction as Jorange -> J4 = Comp146.
+    const Comp147_end_x = J7x;
+    const Comp147_end_y = J7y;
+    // End-effector point (from FK)
+    const EE_x = a * sx + L * fx;
+    const EE_y = a * sy + L * fy;
+
+    const sw = primary ? 1 : 0.6;
+    const op = primary ? 1 : 0.22;
+
+    return `
+      <g opacity="${op}">
+        <!-- Base offset M1 -> M2 (shown as faint dashed line) -->
+        <line x1="0" y1="0" x2="${M2x}" y2="${-M2y}"
+              stroke="#8a96a8" stroke-width="${sw*0.4}" stroke-dasharray="0.3 0.2" opacity="0.6"/>
+
+        <!-- Comp148 passive parallel rod -->
+        <line x1="${M2x}" y1="${-M2y}" x2="${C148end_x}" y2="${-C148end_y}"
+              stroke="#b388ff" stroke-width="${sw*0.9}" stroke-linecap="round"/>
+
+        <!-- Comp139 main upper arm (motor 1 driven) -->
+        <line x1="0" y1="0" x2="${elbowX}" y2="${-elbowY}"
+              stroke="#5fb3ff" stroke-width="${sw*1.3}" stroke-linecap="round"/>
+
+        <!-- Comp151 triangle (proximal coupler, stays parallel to base) -->
+        <polygon points="${Jorange_x},${-Jorange_y} ${Jpurple_x},${-Jpurple_y} ${Jdistal_x},${-Jdistal_y}"
+                 fill="rgba(212,168,255,0.25)" stroke="#d4a8ff"
+                 stroke-width="${sw*0.5}" stroke-linejoin="round"/>
+
+        <!-- Motor 2 indicator (mounted on Comp139 at the elbow) -->
+        <circle cx="${elbowX}" cy="${-elbowY}" r="${sw*0.9}" fill="none"
+                stroke="#ff9f5f" stroke-width="${sw*0.18}" stroke-dasharray="0.2 0.15"/>
+
+        <!-- Comp146 forearm (motor 2 driven) -->
+        <line x1="${elbowX}" y1="${-elbowY}" x2="${J4x}" y2="${-J4y}"
+              stroke="#ff9f5f" stroke-width="${sw*1.3}" stroke-linecap="round"/>
+
+        <!-- Comp147 passive parallel rod -->
+        <line x1="${Jdistal_x}" y1="${-Jdistal_y}" x2="${Comp147_end_x}" y2="${-Comp147_end_y}"
+              stroke="#ffc89f" stroke-width="${sw*0.9}" stroke-linecap="round"
+              stroke-dasharray="0.4 0.3" opacity="0.85"/>
+
+        <!-- Comp143 wrist plate (kept parallel to base) -->
+        <line x1="${J4x}" y1="${-J4y}" x2="${J7x}" y2="${-J7y}"
+              stroke="#ffc89f" stroke-width="${sw*1.0}" stroke-linecap="round"/>
+
+        <!-- End-effector body (vertical, pointing up in +v from the midpoint of Comp143) -->
+        <line x1="${(J4x + J7x) / 2}" y1="${-(J4y + J7y) / 2}" x2="${(J4x + J7x) / 2}" y2="${-((J4y + J7y) / 2 + 6)}"
+              stroke="#e6e9ef" stroke-width="${sw*0.5}" stroke-linecap="round" opacity="0.55"/>
+
+        <!-- Pivots -->
+        <circle cx="0" cy="0" r="${sw*0.45}" fill="#e6e9ef"/>
+        <circle cx="${M2x}" cy="${-M2y}" r="${sw*0.4}" fill="#b388ff" stroke="#0f1419" stroke-width="0.08"/>
+        <circle cx="${elbowX}" cy="${-elbowY}" r="${sw*0.45}" fill="#ff9f5f" stroke="#0f1419" stroke-width="0.1"/>
+        <circle cx="${Jpurple_x}" cy="${-Jpurple_y}" r="${sw*0.36}" fill="#b388ff" stroke="#0f1419" stroke-width="0.08"/>
+        <circle cx="${Jdistal_x}" cy="${-Jdistal_y}" r="${sw*0.36}" fill="#e6e9ef"/>
+        <circle cx="${J4x}" cy="${-J4y}" r="${sw*0.36}" fill="#e6e9ef"/>
+        <circle cx="${J7x}" cy="${-J7y}" r="${sw*0.36}" fill="#e6e9ef"/>
+        <circle cx="${(J4x + J7x) / 2}" cy="${-((J4y + J7y) / 2 + 6)}" r="${sw*0.55}"
+                fill="${primary ? '#6fdc8c' : '#8a96a8'}" stroke="#0f1419" stroke-width="0.12"/>
+      </g>`;
+  }
+
+  function drawMirrored(t1, t2, primary) {
+    // The mirror arm: same drawing as drawLinkage but with all u-coordinates negated.
+    // The translate(-HALF_BASE_SPACING, 0) puts the mirrored M1 at -HALF_BASE_SPACING in u,
+    // and scale(-1, 1) flips the entire arm across the v axis.
+    const inner = drawLinkage(t1, t2, primary);
+    return `<g transform="scale(-1, 1) translate(${HALF_BASE_SPACING} 0)">${inner}</g>`;
+  }
+  let mode = 'fk', elbow = 'up';
+  let t1 = 0, t2 = 0;
+  let u = 38.5, v = 5;
+
+  function updateReadout(s) {
+    const r = document.getElementById('readout');
+    if (s.unreachable) {
+      r.innerHTML = `<div class="err">⚠ Target unreachable</div>
+        <div>r = <span>${s.r.toFixed(2)}</span> cm</div>
+        <div>reach: <span>${s.rmin.toFixed(2)}</span> ≤ r ≤ <span>${s.rmax.toFixed(2)}</span></div>`;
+    } else {
+      const reach = Math.sqrt(s.u*s.u + s.v*s.v);
+      r.innerHTML = `
+        <div>θ₁ = <span>${s.t1.toFixed(2)}°</span> &nbsp; θ₂ = <span>${s.t2.toFixed(2)}°</span></div>
+        <div>α₁ = <span>${(s.t1+k1).toFixed(2)}°</span> &nbsp; α₂ = <span>${(s.t2+k2).toFixed(2)}°</span> rel</div>
+        <div>(u, v) = (<span>${s.u.toFixed(2)}</span>, <span>${s.v.toFixed(2)}</span>) cm</div>
+        <div>r = <span>${reach.toFixed(2)}</span> cm</div>`;
+    }
+  }
+
+  // Tail (Comp138) -- the pivot (R55) is 10 in (25.4 cm) BELOW the arm axis,
+  // centered between the two arms. The tail body hangs further down from
+  // there. Pivots about a horizontal axis (R55).
+  const TAIL_PIVOT_V = -25.4;          // pivot 10 in below arm axis
+  const TAIL_LENGTH = 25.4;            // body length below the pivot (approx)
+  function drawBaseAndTail(swingDeg = 0) {
+    const a = swingDeg * D2R;
+    // Rectangular base body: top corners at the two M1 pivots, bottom
+    // midpoint at the tail pivot. Bottom corners are placed symmetrically
+    // a short distance from the midpoint so the box has a real footprint.
+    const halfW = HALF_BASE_SPACING;            // top half-width = arm spacing/2
+    const bottomHalfW = 4;                      // narrower at the bottom (cosmetic)
+    const topY = 0;
+    const bottomY = TAIL_PIVOT_V;
+
+    // Box corners in world coords (u, v):
+    //   top-left  = (-halfW, 0)         <- left M1
+    //   top-right = (+halfW, 0)         <- right M1
+    //   bottom-right = (+bottomHalfW, TAIL_PIVOT_V)
+    //   bottom-left  = (-bottomHalfW, TAIL_PIVOT_V)
+    const polyPts = [
+      `${-halfW},${-topY}`,
+      `${halfW},${-topY}`,
+      `${bottomHalfW},${-bottomY}`,
+      `${-bottomHalfW},${-bottomY}`,
+    ].join(' ');
+
+    // Tail body
+    const pivotX = 0, pivotY = TAIL_PIVOT_V;
+    const tipX = pivotX + TAIL_LENGTH * Math.sin(a);
+    const tipY = pivotY - TAIL_LENGTH * Math.cos(a);
+
+    return `
+      <g>
+        <!-- Rectangular base body -->
+        <polygon points="${polyPts}"
+                 fill="rgba(91, 99, 115, 0.25)" stroke="#5b6373"
+                 stroke-width="0.4" stroke-linejoin="round"/>
+
+        <!-- Tail body -->
+        <line x1="${pivotX}" y1="${-pivotY}" x2="${tipX}" y2="${-tipY}"
+              stroke="#8a96a8" stroke-width="1.4" stroke-linecap="round" opacity="0.9"/>
+
+        <!-- Tail pivot (R55) -->
+        <circle cx="${pivotX}" cy="${-pivotY}" r="0.6" fill="#e6e9ef"/>
+
+        <!-- Counterweight at tail tip -->
+        <circle cx="${tipX}" cy="${-tipY}" r="1.6" fill="#5b6373" stroke="#0f1419" stroke-width="0.15"/>
+      </g>`;
+  }
+
+  function render() {
+    let primary, state;
+    if (mode === 'fk') {
+      const p = fk(t1, t2);
+      primary = { t1, t2 };
+      state = { t1, t2, u: p.u, v: p.v };
+    } else {
+      const sol = ik(u, v, elbow);
+      if (!sol.reachable) {
+        linkageG.innerHTML =
+          drawBaseAndTail()
+          + `<g transform="translate(${HALF_BASE_SPACING} 0)">${drawLinkage(0, 0, false)}</g>`
+          + drawMirrored(0, 0, false);
+        targetG.innerHTML = `
+          <circle cx="${u}" cy="${-v}" r="0.7" fill="none" stroke="#ff6b6b" stroke-width="0.2"/>
+          <line x1="${u-1}" y1="${-v-1}" x2="${u+1}" y2="${-v+1}" stroke="#ff6b6b" stroke-width="0.22"/>
+          <line x1="${u-1}" y1="${-v+1}" x2="${u+1}" y2="${-v-1}" stroke="#ff6b6b" stroke-width="0.22"/>`;
+        updateReadout({ unreachable: true, ...sol });
+        return;
+      }
+      primary = { t1: sol.t1, t2: sol.t2 };
+      state = { t1: sol.t1, t2: sol.t2, u, v };
+    }
+    linkageG.innerHTML =
+      drawBaseAndTail()
+      + `<g transform="translate(${HALF_BASE_SPACING} 0)">${drawLinkage(primary.t1, primary.t2, true)}</g>`
+      + drawMirrored(primary.t1, primary.t2, true);
+    targetG.innerHTML = mode === 'ik'
+      ? `<circle cx="${u}" cy="${-v}" r="0.8" fill="none" stroke="#6fdc8c" stroke-width="0.16"/>
+         <circle cx="${u}" cy="${-v}" r="0.22" fill="#6fdc8c"/>` : '';
+    updateReadout(state);
+  }
+
+  document.getElementById('mode-fk').onclick = () => {
+    mode = 'fk';
+    document.getElementById('mode-fk').classList.add('active');
+    document.getElementById('mode-ik').classList.remove('active');
+    document.getElementById('fk-controls').style.display = '';
+    document.getElementById('ik-controls').style.display = 'none';
+    render();
+  };
+  document.getElementById('mode-ik').onclick = () => {
+    mode = 'ik';
+    document.getElementById('mode-ik').classList.add('active');
+    document.getElementById('mode-fk').classList.remove('active');
+    document.getElementById('fk-controls').style.display = 'none';
+    document.getElementById('ik-controls').style.display = '';
+    render();
+  };
+  document.getElementById('elb-up').onclick = () => {
+    elbow = 'up';
+    document.getElementById('elb-up').classList.add('active');
+    document.getElementById('elb-dn').classList.remove('active');
+    render();
+  };
+  document.getElementById('elb-dn').onclick = () => {
+    elbow = 'down';
+    document.getElementById('elb-dn').classList.add('active');
+    document.getElementById('elb-up').classList.remove('active');
+    render();
+  };
+  document.getElementById('t1').oninput = e => {
+    t1 = parseFloat(e.target.value);
+    document.getElementById('t1-val').textContent = t1.toFixed(1) + '°';
+    render();
+  };
+  document.getElementById('t2').oninput = e => {
+    t2 = parseFloat(e.target.value);
+    document.getElementById('t2-val').textContent = t2.toFixed(1) + '°';
+    render();
+  };
+  document.getElementById('u').oninput = e => {
+    u = parseFloat(e.target.value);
+    document.getElementById('u-val').textContent = u.toFixed(2);
+    render();
+  };
+  document.getElementById('v').oninput = e => {
+    v = parseFloat(e.target.value);
+    document.getElementById('v-val').textContent = v.toFixed(2);
+    render();
+  };
+
+  function svgCoords(evt) {
+    const pt = svg.createSVGPoint();
+    pt.x = evt.clientX; pt.y = evt.clientY;
+    const ctm = svg.getScreenCTM().inverse();
+    const p = pt.matrixTransform(ctm);
+    return { u: p.x, v: -p.y };
+  }
+  let dragging = false;
+  svg.addEventListener('mousedown', e => {
+    if (mode !== 'ik') return;
+    dragging = true;
+    const c = svgCoords(e);
+    u = c.u; v = c.v;
+    document.getElementById('u').value = u;
+    document.getElementById('v').value = v;
+    document.getElementById('u-val').textContent = u.toFixed(2);
+    document.getElementById('v-val').textContent = v.toFixed(2);
+    render();
+  });
+  svg.addEventListener('mousemove', e => {
+    if (!dragging || mode !== 'ik') return;
+    const c = svgCoords(e);
+    u = c.u; v = c.v;
+    document.getElementById('u').value = u;
+    document.getElementById('v').value = v;
+    document.getElementById('u-val').textContent = u.toFixed(2);
+    document.getElementById('v-val').textContent = v.toFixed(2);
+    render();
+  });
+  window.addEventListener('mouseup', () => { dragging = false; });
+
+  render();
+})();
+</script>
+</body>
+</html>

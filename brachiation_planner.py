@@ -22,6 +22,7 @@ by converting the planned angles into its expected naming convention.
 
 import argparse
 import math
+import os
 import sys
 
 import matplotlib.pyplot as plt
@@ -31,48 +32,403 @@ from matplotlib.patches import FancyArrowPatch
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.optimize import minimize
 
-# Import everything we need from the existing combined module
+# Import COM model (still used for mass-based COM estimation)
 from InvserseKinematic_COM_Combined import (
-    BODY_PIVOT_OFFSET,
-    GRIPPER_DRAW_LENGTH,
-    INCH_TO_M,
-    LINK1_LENGTH,
-    LINK2_LENGTH,
     TAIL_ANGLE_STOP_DEG,
     TAIL_GUI_OFFSET_DEG,
     TAIL_PIVOT_Y,
     TAIL_LENGTH,
     COM_Prediction,
-    forward_kinematics_2link,
-    ik_2link,
-    to_com_right_arm_angles_deg,
+    INCH_TO_M,
 )
+
+# Import Willy IK — the real arm kinematics
+import willy_ik
+
+# ── Willy arm geometry (from willy_ik.py / context.md) ───────────────────────
+A_CM  = willy_ik.A              # 9.778 cm upper arm
+L_CM  = willy_ik.L              # 36.786 cm forearm + wrist
+K1    = willy_ik.K1             # +27.963 deg shoulder offset
+K2    = willy_ik.K2             # -31.965 deg elbow offset
+
+# Convert to metres for the planner
+A_M   = A_CM / 100.0           # 0.09778 m
+L_M   = L_CM / 100.0           # 0.36786 m
+
+# Bilateral arm spacing: 11.7055 in = 29.7320 cm between M1 pivots.
+# Each arm's M1 sits at +/- HALF_BASE_SPACING from body centre.
+HALF_BASE_SPACING_CM = 11.7055 * 2.54 / 2.0   # 14.866 cm
+BODY_PIVOT_OFFSET    = HALF_BASE_SPACING_CM / 100.0   # m
+
+# Gripper: 6 cm vertical from wrist plate midpoint (from visualizer).
+# The double parallelogram keeps the wrist plate parallel to the base,
+# so the gripper always points straight up (+v direction).
+GRIPPER_DRAW_LENGTH = 0.06   # 6 cm in metres
+
+# Default link lengths for the planner (overrides old 3.4" / 11.8")
+LINK1_LENGTH = A_M
+LINK2_LENGTH = L_M
 
 # ── Bar geometry ─────────────────────────────────────────────────────────────
 BAR_SPACING = 12.0 * INCH_TO_M          # 12 in -> metres
-BAR_Y       = (LINK1_LENGTH + LINK2_LENGTH) + GRIPPER_DRAW_LENGTH + 0.02
+BAR_Y       = (A_M + L_M) + GRIPPER_DRAW_LENGTH + 0.02
 # Bars positioned so that bar 1 is at x=0 (body-centered) and bar 2 is to
 # the right (+x in plot frame).
 
+
+# ── Willy FK / IK wrappers (work in metres, return numpy arrays) ─────────────
+
+_D2R = math.pi / 180.0
+_R2D = 180.0 / math.pi
+
+
+def willy_fk_m(theta1_deg, theta2_deg):
+    """Willy FK: motor angles (deg) → end-effector (u, v) in metres."""
+    u_cm, v_cm = willy_ik.fk(theta1_deg, theta2_deg)
+    return np.array([u_cm / 100.0, v_cm / 100.0])
+
+
+def willy_fk_joints_m(theta1_deg, theta2_deg):
+    """Willy FK: return (shoulder, elbow, hand) positions in metres.
+
+    Uses the same angle convention as willy_ik.py:
+        alpha1 = theta1 + K1,  alpha2 = theta2 + K2
+    """
+    alpha1 = (theta1_deg + K1) * _D2R
+    alpha2 = (theta2_deg + K2) * _D2R
+    alpha12 = alpha1 + alpha2
+    shoulder = np.array([0.0, 0.0])
+    elbow = np.array([A_M * math.cos(alpha1), A_M * math.sin(alpha1)])
+    hand = np.array([
+        A_M * math.cos(alpha1) + L_M * math.cos(alpha12),
+        A_M * math.sin(alpha1) + L_M * math.sin(alpha12),
+    ])
+    return shoulder, elbow, hand
+
+
+def willy_ik_m(u_m, v_m, elbow='up'):
+    """Willy IK: target (u, v) in metres → motor angles (deg)."""
+    u_cm = u_m * 100.0
+    v_cm = v_m * 100.0
+    return willy_ik.ik(u_cm, v_cm, elbow=elbow)
+
+
+# ── Collision detection (optional) ────────────────────────────────────────────
+
+_collision_model = None
+
+def get_collision_model():
+    """Lazy-load the collision model (heavy — only load once)."""
+    global _collision_model
+    if _collision_model is not None:
+        return _collision_model
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'files'))
+        from willy_collision import ArmCollisionModel
+        mesh_dir = os.path.join(os.path.dirname(__file__), 'willy_meshes')
+        _collision_model = ArmCollisionModel(
+            mesh_dir, use_convex_hulls=True, include_tail=True)
+        print(f"[collision] Model loaded from {mesh_dir}")
+    except (ImportError, FileNotFoundError) as e:
+        print(f"[collision] Could not load: {e}")
+        _collision_model = None
+    return _collision_model
+
+
+# Inter-arm pairs that always overlap due to shared bilateral base structure
+_INTER_ARM_SKIP = {
+    frozenset(['base', 'base']),
+    frozenset(['base', 'Component139']),
+    frozenset(['base', 'Component148']),
+    frozenset(['base', 'Component151']),
+}
+
+
+def check_collision_at_waypoint(t1_grip_deg, t2_grip_deg, t1_free_deg, t2_free_deg,
+                                 tail_deg=0.0, grip_is_right=False):
+    """Check collision for a single waypoint using the mesh model.
+
+    Builds a proper asymmetric collision scene: left arm at its angles,
+    right arm at its angles, then checks all pairwise contacts.
+    """
+    model = get_collision_model()
+    if model is None:
+        return True, []
+
+    import trimesh.collision
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'files'))
+    from willy_collision import link_transforms, tail_transform
+
+    # Determine which motor angles go to which side
+    if grip_is_right:
+        right_t1, right_t2 = t1_grip_deg, t2_grip_deg
+        left_t1, left_t2 = t1_free_deg, t2_free_deg
+    else:
+        left_t1, left_t2 = t1_grip_deg, t2_grip_deg
+        right_t1, right_t2 = t1_free_deg, t2_free_deg
+
+    # Build collision manager with each arm at its own angles
+    manager = trimesh.collision.CollisionManager()
+
+    right_tfs = link_transforms(right_t1, right_t2, side='right')
+    left_tfs = link_transforms(left_t1, left_t2, side='left')
+
+    for name, mesh in model.meshes.items():
+        if name in right_tfs:
+            manager.add_object(f'right_{name}', mesh, transform=right_tfs[name])
+        if name in left_tfs:
+            manager.add_object(f'left_{name}', mesh, transform=left_tfs[name])
+
+    # Add tail
+    if model.tail_mesh is not None:
+        manager.add_object('tail', model.tail_mesh,
+                           transform=tail_transform(tail_deg))
+
+    # Check collisions
+    is_collision, names = manager.in_collision_internal(return_names=True)
+
+    # Extended skip pairs — same-arm adjacent links + inter-arm base overlap
+    _SAME_ARM_SKIP = {
+        frozenset(['Component139', 'Component151']),
+        frozenset(['Component139', 'Component146']),
+        frozenset(['Component139', 'Component148']),  # share M1/M2 pivot area
+        frozenset(['Component151', 'Component146']),
+        frozenset(['Component151', 'Component147']),
+        frozenset(['Component151', 'Component148']),
+        frozenset(['Component146', 'Component143']),
+        frozenset(['Component146', 'Component147']),  # close at J_distal
+        frozenset(['Component147', 'Component143']),
+        frozenset(['Component139', 'base']),
+        frozenset(['Component148', 'base']),
+        frozenset(['Component151', 'base']),
+    }
+
+    contacts = []
+    for a, b in names:
+        side_a = a.split('_', 1)[0] if '_' in a else ''
+        side_b = b.split('_', 1)[0] if '_' in b else ''
+        base_a = a.split('_', 1)[1] if '_' in a else a
+        base_b = b.split('_', 1)[1] if '_' in b else b
+
+        # Skip ALL inter-arm pairs — the bilateral spacing physically
+        # separates the arms; the 3D mesh overlap is an artifact of
+        # both arms being placed in the same working plane.
+        if side_a != side_b:
+            continue
+
+        # Skip same-arm adjacent pairs (share pin joints)
+        if frozenset([base_a, base_b]) in _SAME_ARM_SKIP:
+            continue
+
+        # Skip tail-base (pinned)
+        if 'tail' in a or 'tail' in b:
+            if 'base' in a or 'base' in b:
+                continue
+
+        contacts.append((a, b))
+
+    return len(contacts) == 0, contacts
+
+
+def mesh_outlines_2d(t1_deg, t2_deg, shoulder_world, side='right', is_mirrored=False):
+    """Get 2D convex-hull outlines of all arm meshes at the given pose.
+
+    Transforms each STL mesh into the working plane, projects to 2D,
+    computes the convex hull, and returns polygon vertices in the planner's
+    world frame (metres).
+
+    Parameters
+    ----------
+    t1_deg, t2_deg : motor angles
+    shoulder_world : (x, y) shoulder position in planner frame (metres)
+    side : 'right' or 'left' for the collision model
+    is_mirrored : if True, negate x (for left arm in planner frame)
+
+    Returns list of (xs, ys, name) tuples for each link's 2D outline.
+    """
+    model = get_collision_model()
+    if model is None:
+        return []
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'files'))
+    from willy_collision import link_transforms, HALF_BASE_SPACING, WORLD_ORIGIN_Y, WORLD_ORIGIN_Z
+
+    tfs = link_transforms(t1_deg, t2_deg, side=side)
+
+    # M1 position in collision model's world Y-Z coords
+    sign = 1.0 if side == 'right' else -1.0
+    m1_world_y = WORLD_ORIGIN_Y + sign * HALF_BASE_SPACING
+    m1_world_z = WORLD_ORIGIN_Z
+
+    outlines = []
+    for name, mesh in model.meshes.items():
+        if name not in tfs:
+            continue
+        tf = tfs[name]
+
+        # Transform vertices to collision world frame
+        verts_h = np.ones((len(mesh.vertices), 4))
+        verts_h[:, :3] = mesh.vertices
+        world_verts = (tf @ verts_h.T).T[:, :3]
+
+        # Project to working plane: u = worldY - M1_worldY, v = worldZ - M1_worldZ
+        # STLs are in MM (Fusion default), transforms are in CM.
+        # The transform translations (cm) are mixed with mesh coords (mm)
+        # in the result, but empirically the output is in mm-scale.
+        # Convert mm → m by dividing by 1000.
+        u_mm = world_verts[:, 1] - m1_world_y * 10.0  # convert cm origin to mm
+        v_mm = world_verts[:, 2] - m1_world_z * 10.0
+
+        # Convert to planner frame (metres), apply mirror for left arm
+        if is_mirrored:
+            x_m = shoulder_world[0] - u_mm / 1000.0
+        else:
+            x_m = shoulder_world[0] + u_mm / 1000.0
+        y_m = shoulder_world[1] + v_mm / 1000.0
+
+        # 2D convex hull
+        points_2d = np.column_stack([x_m, y_m])
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(points_2d)
+            hull_xs = points_2d[hull.vertices, 0].tolist() + [points_2d[hull.vertices[0], 0]]
+            hull_ys = points_2d[hull.vertices, 1].tolist() + [points_2d[hull.vertices[0], 1]]
+            outlines.append((hull_xs, hull_ys, name))
+        except Exception:
+            pass  # degenerate hull, skip
+
+    return outlines
+
+
+def willy_gripper_tip_local(t1_deg, t2_deg):
+    """Compute the gripper contact point (top of green line) in arm-local
+    frame (M1 at origin, metres).
+
+    This is the midpoint of the wrist plate (Comp143) plus 6 cm vertically.
+    The wrist plate stays horizontal (parallel to base) due to the
+    parallelogram, so its horizontal offset is constant in world coords.
+    """
+    alpha1 = (t1_deg + K1) * _D2R
+    alpha2 = (t2_deg + K2) * _D2R
+    alpha12 = alpha1 + alpha2
+    fx, fy = math.cos(alpha12), math.sin(alpha12)
+
+    # Elbow position
+    elbow_x = A_M * math.cos(alpha1)
+    elbow_y = A_M * math.sin(alpha1)
+
+    # J4 = end of Comp146 (forearm)
+    j4_x = elbow_x + _FOREARM_DRAW * fx
+    j4_y = elbow_y + _FOREARM_DRAW * fy
+
+    # J7 = J4 + wrist plate (horizontal, stays parallel to base)
+    j7_x = j4_x + _WRIST_PLATE
+    j7_y = j4_y  # same y because plate is horizontal
+
+    # Gripper tip = midpoint of wrist plate + 6 cm up
+    ee_x = (j4_x + j7_x) / 2.0
+    ee_y = (j4_y + j7_y) / 2.0 + _EE_LENGTH
+
+    return np.array([ee_x, ee_y])
+
+
+# Parallelogram geometry constants (from Fusion model, in metres)
+_FOREARM_DRAW = (L_CM - 7.62) / 100.0     # Comp146 length (29.166 cm)
+_WRIST_PLATE  = 7.62 / 100.0              # Comp143 length (7.62 cm)
+_M2_OFFSET    = np.array([7.62, -3.493]) / 100.0   # M2 base pivot offset from M1
+_COMP151_DISTAL = np.array([7.62, 0.0]) / 100.0    # Comp151 distal corner from elbow
+_COMP151_PURPLE = np.array([7.62, -3.493]) / 100.0 # Comp151 purple corner from elbow
+_EE_LENGTH    = 0.06                       # 6 cm end-effector above wrist plate
+
+
+def willy_arm_segments(t1_deg, t2_deg):
+    """Compute all drawing segments for one Willy double-parallelogram arm.
+
+    Returns a list of dicts, each with 'xs', 'ys', 'color', 'width', 'style'.
+    All coordinates in arm-local frame (M1 at origin, metres).
+    Matches the drawing from willy_ik_visualizer.html.
+    """
+    alpha1 = (t1_deg + K1) * _D2R
+    alpha2 = (t2_deg + K2) * _D2R
+    alpha12 = alpha1 + alpha2
+
+    sx, sy = math.cos(alpha1), math.sin(alpha1)
+    fx, fy = math.cos(alpha12), math.sin(alpha12)
+
+    # Key positions
+    M1 = np.array([0.0, 0.0])
+    M2 = _M2_OFFSET.copy()
+    elbow = np.array([A_M * sx, A_M * sy])
+
+    # Comp151 triangle (stays parallel to base — only translates with elbow)
+    J_orange = elbow.copy()
+    J_distal = elbow + _COMP151_DISTAL
+    J_purple = elbow + _COMP151_PURPLE
+
+    # Comp146 forearm: elbow → J4
+    J4 = elbow + np.array([_FOREARM_DRAW * fx, _FOREARM_DRAW * fy])
+
+    # Comp143 wrist plate (parallel to base): J4 → J7
+    J7 = J4 + np.array([_WRIST_PLATE, 0.0])
+
+    # End-effector (vertical from wrist plate midpoint)
+    ee_base = (J4 + J7) / 2.0
+    ee_tip = ee_base + np.array([0.0, _EE_LENGTH])
+
+    segs = []
+
+    # 1. Base offset M1 → M2 (faint dashed)
+    segs.append({'xs': [M1[0], M2[0]], 'ys': [M1[1], M2[1]],
+                 'color': '#8a96a8', 'width': 0.8, 'style': '--'})
+
+    # 2. Comp148 passive rod (M2 → J_purple)
+    segs.append({'xs': [M2[0], J_purple[0]], 'ys': [M2[1], J_purple[1]],
+                 'color': '#b388ff', 'width': 1.8, 'style': '-'})
+
+    # 3. Comp139 upper arm (M1 → elbow)
+    segs.append({'xs': [M1[0], elbow[0]], 'ys': [M1[1], elbow[1]],
+                 'color': '#5fb3ff', 'width': 2.5, 'style': '-'})
+
+    # 4. Comp151 triangle (3 edges)
+    tri_xs = [J_orange[0], J_purple[0], J_distal[0], J_orange[0]]
+    tri_ys = [J_orange[1], J_purple[1], J_distal[1], J_orange[1]]
+    segs.append({'xs': tri_xs, 'ys': tri_ys,
+                 'color': '#d4a8ff', 'width': 1.2, 'style': '-'})
+
+    # 5. Comp146 forearm (elbow → J4)
+    segs.append({'xs': [elbow[0], J4[0]], 'ys': [elbow[1], J4[1]],
+                 'color': '#ff9f5f', 'width': 2.5, 'style': '-'})
+
+    # 6. Comp147 passive rod (J_distal → J7)
+    segs.append({'xs': [J_distal[0], J7[0]], 'ys': [J_distal[1], J7[1]],
+                 'color': '#ffc89f', 'width': 1.8, 'style': '--'})
+
+    # 7. Comp143 wrist plate (J4 → J7)
+    segs.append({'xs': [J4[0], J7[0]], 'ys': [J4[1], J7[1]],
+                 'color': '#ffc89f', 'width': 2.0, 'style': '-'})
+
+    # 8. End-effector (vertical from wrist plate midpoint)
+    segs.append({'xs': [ee_base[0], ee_tip[0]], 'ys': [ee_base[1], ee_tip[1]],
+                 'color': '#6fdc8c', 'width': 1.5, 'style': '-'})
+
+    return segs, {'M1': M1, 'M2': M2, 'elbow': elbow, 'J4': J4, 'J7': J7,
+                  'ee_base': ee_base, 'ee_tip': ee_tip, 'hand': ee_tip}
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def fk_hand_local(phi, theta, L1, L2):
-    """Hand position in the shoulder-local frame."""
-    x_coords, y_coords = forward_kinematics_2link(phi, theta, L1, L2)
-    return np.array([x_coords[-1], y_coords[-1]])
+def shoulder_from_bar(bar_pos, t1_grip_deg, t2_grip_deg, grip_is_left=False):
+    """Given a bar position and gripping-arm Willy motor angles, return the
+    shoulder (M1) position in the world frame.
 
-
-def shoulder_from_bar(bar_pos, phi_grip, theta_grip, L1, L2):
-    """Given a bar position and gripping-arm IK angles, return the shoulder
-    position in the world frame.
-
-    The gripper hangs straight down from the bar (parallelogram), so:
-        hand_world = bar_pos - (0, GRIPPER_LEN)
-        shoulder   = hand_world - hand_local
+    The gripper tip (top of green line) contacts the bar directly.
+    shoulder = bar_pos - gripper_tip_local (with x mirrored for left arm).
     """
-    hand_local = fk_hand_local(phi_grip, theta_grip, L1, L2)
-    hand_world = bar_pos - np.array([0.0, GRIPPER_DRAW_LENGTH])
-    shoulder_world = hand_world - hand_local
+    tip_local = willy_gripper_tip_local(t1_grip_deg, t2_grip_deg)
+    if grip_is_left:
+        # Left arm: local +x maps to world -x
+        shoulder_world = bar_pos - np.array([-tip_local[0], tip_local[1]])
+    else:
+        shoulder_world = bar_pos - tip_local
     return shoulder_world
 
 
@@ -92,34 +448,42 @@ def body_and_free_shoulder(grip_shoulder, grip_is_right):
     return body_center, free_shoulder
 
 
-def free_hand_world(free_shoulder, phi_free, theta_free, L1, L2, free_is_right):
-    """Free hand position in world frame.  For the right arm, +x local is
-    +x world.  For the left arm, +x local maps to -x world (mirror)."""
-    hand_local = fk_hand_local(phi_free, theta_free, L1, L2)
-    if free_is_right:
-        return free_shoulder + hand_local
+def free_hand_world(free_shoulder, t1_free_deg, t2_free_deg, free_is_left):
+    """Free gripper-tip position in world frame.
+    Uses the actual gripper tip (top of green line from parallelogram geometry).
+    For the right arm, +u local = +x world.
+    For the left arm, +u local = -x world (mirror)."""
+    tip_local = willy_gripper_tip_local(t1_free_deg, t2_free_deg)
+    if free_is_left:
+        return free_shoulder + np.array([-tip_local[0], tip_local[1]])
     else:
-        return free_shoulder + np.array([-hand_local[0], hand_local[1]])
+        return free_shoulder + tip_local
 
 
-def compute_com_world(phi_grip, theta_grip, phi_free, theta_free,
-                      theta_tail_gui, grip_is_right, bar_pos, L1, L2):
-    """Return (com_world_x, com_world_y) using COM_Prediction.
+def compute_com_world(t1_grip_deg, t2_grip_deg, t1_free_deg, t2_free_deg,
+                      theta_tail_gui, grip_is_right, bar_pos):
+    """Return (com_world_x, com_world_y) using the old mass model.
 
-    Internally converts everything into the body frame that COM_Prediction
-    expects, runs it, then maps the result back to world coordinates.
+    Converts Willy motor angles to COM_Prediction's convention via K1/K2,
+    then maps body-frame COM back to world coordinates.
     """
-    grip_shoulder = shoulder_from_bar(bar_pos, phi_grip, theta_grip, L1, L2)
-    body_center, free_shoulder = body_and_free_shoulder(grip_shoulder, grip_is_right)
+    grip_shoulder = shoulder_from_bar(bar_pos, t1_grip_deg, t2_grip_deg,
+                                     grip_is_left=not grip_is_right)
+    body_center, _ = body_and_free_shoulder(grip_shoulder, grip_is_right)
 
-    # Convert IK angles to COM_Prediction naming
-    # Right arm: theta_1 = degrees(theta), theta_2 = degrees(phi) - 180
+    # Map Willy motor angles → COM_Prediction convention:
+    #   COM's theta_1 = absolute shoulder angle = motor_theta1 + K1
+    #   COM's theta_2 = relative elbow angle   = motor_theta2 + K2
     if grip_is_right:
-        r_theta_1, r_theta_2, _ = to_com_right_arm_angles_deg(phi_grip, theta_grip)
-        l_theta_1, l_theta_2, _ = to_com_right_arm_angles_deg(phi_free, theta_free)
+        r_theta_1 = t1_grip_deg + K1
+        r_theta_2 = t2_grip_deg + K2
+        l_theta_1 = t1_free_deg + K1
+        l_theta_2 = t2_free_deg + K2
     else:
-        r_theta_1, r_theta_2, _ = to_com_right_arm_angles_deg(phi_free, theta_free)
-        l_theta_1, l_theta_2, _ = to_com_right_arm_angles_deg(phi_grip, theta_grip)
+        r_theta_1 = t1_free_deg + K1
+        r_theta_2 = t2_free_deg + K2
+        l_theta_1 = t1_grip_deg + K1
+        l_theta_2 = t2_grip_deg + K2
 
     theta_tail_internal = theta_tail_gui + TAIL_GUI_OFFSET_DEG
 
@@ -130,45 +494,32 @@ def compute_com_world(phi_grip, theta_grip, phi_free, theta_free,
     )
 
     # COM_Prediction returns body-frame inches.  Convert to metres.
-    # Our world frame has body_center at body_center, with x mirrored
-    # (plot +x = body-frame -x).
+    # Our world frame has body_center at body_center, with x mirrored.
     com_world_x = body_center[0] - x_com_in * INCH_TO_M
     com_world_y = body_center[1] + y_com_in * INCH_TO_M
     return com_world_x, com_world_y
 
 
 # ── Angle ↔ flat-vector helpers ──────────────────────────────────────────────
-# State per waypoint: [shoulder_grip, elbow_grip, shoulder_free, elbow_free, tail]
-# All in RADIANS (IK convention: shoulder = theta, elbow_inner = phi).
-# We store (theta_grip, phi_grip, theta_free, phi_free, tail_gui_rad).
+# State per waypoint: [t1_grip, t2_grip, t1_free, t2_free, tail]
+# All in RADIANS.  t1/t2 are Willy MOTOR angles (before K1/K2 offset).
 STATE_DIM = 5
 
-def pack_state(theta_grip, phi_grip, theta_free, phi_free, tail_gui_deg):
-    return np.array([theta_grip, phi_grip, theta_free, phi_free,
+def pack_state(t1_grip_deg, t2_grip_deg, t1_free_deg, t2_free_deg, tail_gui_deg):
+    return np.array([math.radians(t1_grip_deg), math.radians(t2_grip_deg),
+                     math.radians(t1_free_deg), math.radians(t2_free_deg),
                      math.radians(tail_gui_deg)])
 
 def unpack_state(x):
-    theta_grip = x[0]
-    phi_grip   = x[1]
-    theta_free = x[2]
-    phi_free   = x[3]
-    tail_gui_deg = math.degrees(x[4])
-    return theta_grip, phi_grip, theta_free, phi_free, tail_gui_deg
+    """Returns (t1_grip_deg, t2_grip_deg, t1_free_deg, t2_free_deg, tail_gui_deg)."""
+    return (math.degrees(x[0]), math.degrees(x[1]),
+            math.degrees(x[2]), math.degrees(x[3]),
+            math.degrees(x[4]))
 
 
-# ── Joint limits (motor-space, same convention as the GUI) ───────────────────
-# shoulder_motor = dir * (theta_deg - zero_deg)
-# We use zero=90, dir=1 → motor = theta_deg - 90.
-SHOULDER_ZERO = 90.0
-ELBOW_ZERO    = 0.0
-
-def theta_to_motor(theta_rad):
-    """Shoulder geometry angle (rad) → motor angle (deg)."""
-    return math.degrees(theta_rad) - SHOULDER_ZERO
-
-def phi_to_motor(phi_rad):
-    """Elbow inner angle (rad) → motor angle (deg).  motor = 180 - phi."""
-    return 180.0 - math.degrees(phi_rad) - ELBOW_ZERO
+def motor_angle_str(t1_deg, t2_deg):
+    """Format Willy motor angles for display."""
+    return f"t1={t1_deg:+6.1f}° t2={t2_deg:+6.1f}°"
 
 
 # ── Optimisation ─────────────────────────────────────────────────────────────
@@ -182,12 +533,15 @@ def plan_trajectory(
     right_elbow_lim=(-90.4, 140.0),
     left_shoulder_lim=(-46.0, 70.9),
     left_elbow_lim=(-140.0, 90.4),
-    tail_lim=(-60.0, 60.0),
+    tail_lim=(0.0, 0.0),         # tail fixed straight down
     com_tolerance=0.01,       # metres — how far COM_x may drift from bar
     smoothness_weight=0.5,
     reach_weight=10.0,
 ):
     """Plan a brachiation trajectory from bar 1 to bar 2.
+
+    State per waypoint: [t1_grip, t2_grip, t1_free, t2_free, tail] in RADIANS.
+    Motor angles use Willy convention (geometry angle = motor + K offset).
 
     Returns an (n_waypoints, STATE_DIM) array of joint-angle waypoints plus
     auxiliary info (COM positions, hand positions, etc.) for visualisation.
@@ -197,49 +551,36 @@ def plan_trajectory(
 
     free_is_right = not grip_is_right
 
-    # Determine per-arm motor limits based on which arm is gripping
+    # Determine per-arm motor limits (in degrees) based on which arm is gripping
     if grip_is_right:
-        grip_sh_lim  = right_shoulder_lim
-        grip_el_lim  = right_elbow_lim
-        free_sh_lim  = left_shoulder_lim
-        free_el_lim  = left_elbow_lim
+        grip_t1_lim = right_shoulder_lim
+        grip_t2_lim = right_elbow_lim
+        free_t1_lim = left_shoulder_lim
+        free_t2_lim = left_elbow_lim
     else:
-        grip_sh_lim  = left_shoulder_lim
-        grip_el_lim  = left_elbow_lim
-        free_sh_lim  = right_shoulder_lim
-        free_el_lim  = right_elbow_lim
+        grip_t1_lim = left_shoulder_lim
+        grip_t2_lim = left_elbow_lim
+        free_t1_lim = right_shoulder_lim
+        free_t2_lim = right_elbow_lim
 
-    def motor_to_theta_bounds(sh_lim):
-        """Motor limits → geometry theta bounds (rad)."""
-        lo = math.radians(sh_lim[0] + SHOULDER_ZERO)
-        hi = math.radians(sh_lim[1] + SHOULDER_ZERO)
-        return (lo, hi)
+    # Convert degree limits to radian bounds for the optimiser
+    def deg_to_rad_bounds(lim):
+        return (math.radians(lim[0]), math.radians(lim[1]))
 
-    def motor_to_phi_bounds(el_lim):
-        """Motor limits → geometry phi bounds (rad).  phi = 180 - motor."""
-        lo = math.radians(180.0 - el_lim[1])   # max motor → min phi
-        hi = math.radians(180.0 - el_lim[0])   # min motor → max phi
-        return (lo, hi)
+    per_wp_bounds = [
+        deg_to_rad_bounds(grip_t1_lim),
+        deg_to_rad_bounds(grip_t2_lim),
+        deg_to_rad_bounds(free_t1_lim),
+        deg_to_rad_bounds(free_t2_lim),
+        deg_to_rad_bounds(tail_lim),
+    ]
 
-    grip_theta_bnd = motor_to_theta_bounds(grip_sh_lim)
-    grip_phi_bnd   = motor_to_phi_bounds(grip_el_lim)
-    free_theta_bnd = motor_to_theta_bounds(free_sh_lim)
-    free_phi_bnd   = motor_to_phi_bounds(free_el_lim)
-    tail_bnd       = (math.radians(tail_lim[0]), math.radians(tail_lim[1]))
-
-    per_wp_bounds = [grip_theta_bnd, grip_phi_bnd,
-                     free_theta_bnd, free_phi_bnd,
-                     tail_bnd]
-
-    # Initial guess: everything straight up (theta=90°, phi=180°=straight)
-    # and tail at 0 (hanging).
-    x0_single = pack_state(
-        theta_grip=math.radians(90),
-        phi_grip=math.radians(180),
-        theta_free=math.radians(90),
-        phi_free=math.radians(180),
-        tail_gui_deg=0.0,
-    )
+    # Initial guess: arms reaching UP so the body hangs below the bar.
+    # alpha1 ≈ 90° (shoulder pointing up) → t1 = 90 - K1 ≈ 62°
+    # alpha2 ≈ 0° (forearm continues up) → t2 = 0 - K2 ≈ 32°
+    t1_up = 90.0 - K1   # ≈ 62°
+    t2_up = 0.0 - K2    # ≈ 32°
+    x0_single = pack_state(t1_up, t2_up, t1_up, t2_up, 0.0)
     x0 = np.tile(x0_single, n_waypoints)
 
     # Build flat bounds
@@ -251,16 +592,17 @@ def plan_trajectory(
         infos = []
 
         for k in range(n_waypoints):
-            theta_g, phi_g, theta_f, phi_f, tail_deg = unpack_state(X[k])
+            t1g, t2g, t1f, t2f, tail_deg = unpack_state(X[k])
 
             # Gripping arm shoulder
-            grip_sh = shoulder_from_bar(bar1, phi_g, theta_g, L1, L2)
+            grip_sh = shoulder_from_bar(bar1, t1g, t2g,
+                                         grip_is_left=not grip_is_right)
             _, free_sh = body_and_free_shoulder(grip_sh, grip_is_right)
 
-            # Free hand position — the gripper tip is what touches the bar,
-            # not the hand itself.  Gripper extends vertically above the hand.
-            fh = free_hand_world(free_sh, phi_f, theta_f, L1, L2, free_is_right)
-            gripper_tip = fh + np.array([0.0, GRIPPER_DRAW_LENGTH])
+            # Free gripper tip position (top of green line = bar contact point).
+            # free_hand_world now returns the actual gripper tip directly.
+            fh = free_hand_world(free_sh, t1f, t2f, free_is_left=grip_is_right)
+            gripper_tip = fh
 
             # Progress fraction — smooth hook trajectory.
             # The gripper swings across to bar 2 then approaches from
@@ -274,12 +616,12 @@ def plan_trajectory(
             # y: smooth cosine dip — peaks (bar height) at t=0 and t=1,
             # lowest point at t≈0.65 (near bar 2 x-position), dipping
             # 3 inches below bar.
-            dip_depth = 3.0 * INCH_TO_M  # 3 inches below bar
+            dip_depth = 8.0 * INCH_TO_M  # 8 inches below bar
             # Shift the dip center toward the end (t=0.65) so the
             # approach to bar 2 comes from below.
-            dip_center = 0.65
+            dip_center = 0.50
             # Use a Gaussian-like bump centered at dip_center
-            sigma = 0.25  # controls width / smoothness
+            sigma = 0.35  # wider arc, smoother curve
             dip = dip_depth * math.exp(-0.5 * ((t - dip_center) / sigma) ** 2)
             target_y = bar1[1] - dip
 
@@ -300,8 +642,8 @@ def plan_trajectory(
 
             if return_info:
                 com_x, com_y = compute_com_world(
-                    phi_g, theta_g, phi_f, theta_f, tail_deg,
-                    grip_is_right, bar1, L1, L2,
+                    t1g, t2g, t1f, t2f, tail_deg,
+                    grip_is_right, bar1,
                 )
                 infos.append({
                     "grip_shoulder": grip_sh,
@@ -329,23 +671,45 @@ def plan_trajectory(
         def make_com_lo(kk):
             def con(x_flat):
                 X = x_flat.reshape(n_waypoints, STATE_DIM)
-                tg, pg, tf, pf, td = unpack_state(X[kk])
-                cx, _ = compute_com_world(pg, tg, pf, tf, td,
-                                          grip_is_right, bar1, L1, L2)
+                t1g, t2g, t1f, t2f, td = unpack_state(X[kk])
+                cx, _ = compute_com_world(t1g, t2g, t1f, t2f, td,
+                                          grip_is_right, bar1)
                 return cx - bar1_x + 3.0 * com_tolerance  # generous backward
             return con
 
         def make_com_hi(kk):
             def con(x_flat):
                 X = x_flat.reshape(n_waypoints, STATE_DIM)
-                tg, pg, tf, pf, td = unpack_state(X[kk])
-                cx, _ = compute_com_world(pg, tg, pf, tf, td,
-                                          grip_is_right, bar1, L1, L2)
+                t1g, t2g, t1f, t2f, td = unpack_state(X[kk])
+                cx, _ = compute_com_world(t1g, t2g, t1f, t2f, td,
+                                          grip_is_right, bar1)
                 return bar1_x + com_tolerance - cx  # tight forward
             return con
 
         constraints.append({"type": "ineq", "fun": make_com_lo(k)})
         constraints.append({"type": "ineq", "fun": make_com_hi(k)})
+
+    # Hard equality constraint: final waypoint gripper tip must be AT bar 2.
+    def final_grip_x(x_flat):
+        X = x_flat.reshape(n_waypoints, STATE_DIM)
+        t1g, t2g, t1f, t2f, td = unpack_state(X[-1])
+        grip_sh = shoulder_from_bar(bar1, t1g, t2g,
+                                    grip_is_left=not grip_is_right)
+        _, free_sh = body_and_free_shoulder(grip_sh, grip_is_right)
+        tip = free_hand_world(free_sh, t1f, t2f, free_is_left=grip_is_right)
+        return tip[0] - bar2[0]
+
+    def final_grip_y(x_flat):
+        X = x_flat.reshape(n_waypoints, STATE_DIM)
+        t1g, t2g, t1f, t2f, td = unpack_state(X[-1])
+        grip_sh = shoulder_from_bar(bar1, t1g, t2g,
+                                    grip_is_left=not grip_is_right)
+        _, free_sh = body_and_free_shoulder(grip_sh, grip_is_right)
+        tip = free_hand_world(free_sh, t1f, t2f, free_is_left=grip_is_right)
+        return tip[1] - bar2[1]
+
+    constraints.append({"type": "eq", "fun": final_grip_x})
+    constraints.append({"type": "eq", "fun": final_grip_y})
 
     print(f"Optimising {n_waypoints} waypoints × {STATE_DIM} DOF "
           f"= {n_waypoints * STATE_DIM} variables …")
@@ -370,26 +734,81 @@ def plan_trajectory(
 # ── Visualisation ────────────────────────────────────────────────────────────
 
 def draw_robot_at_waypoint(ax, info, grip_is_right, L1, L2, alpha=1.0,
-                           arm_color_grip="#0f766e", arm_color_free="#16a34a",
-                           bar_pos=None):
-    """Draw the full robot for one waypoint with pendulum tilt applied."""
+                           bar_pos=None, show_meshes=False):
+    """Draw the full robot for one waypoint.
+
+    Uses the Willy double-parallelogram arm style from the HTML visualizer.
+    If show_meshes=True, also draws translucent convex hull outlines of
+    the actual STL meshes.
+    """
     segments = get_robot_segments(info, grip_is_right, L1, L2, bar_pos=bar_pos)
 
-    # Segment order: body, grip_arm, grip_gripper, free_arm, free_gripper,
-    #                body_box, tail, com_point
-    seg_colors = ["#6b7280", arm_color_grip, "#7c3aed",
-                  arm_color_free, "#7c3aed",
-                  "#4b5563", "#d97706", "#0891b2"]
-    seg_widths = [4, 3, 2, 3, 2, 2, 3, 0]
-    seg_styles = ["-", "-", "--", "-", "--", "-", "-", ""]
+    # Segment structure:
+    #   [0]        body line
+    #   [1..8]     grip arm (8 parallelogram segments from willy_arm_segments)
+    #   [9..16]    free arm (8 parallelogram segments)
+    #   [17]       body box
+    #   [18]       tail
+    #   [19]       COM point
+    #
+    # We draw with appropriate colors from willy_arm_segments.
+    # Get the color/style info from a dummy call for reference:
+    ref_segs, _ = willy_arm_segments(0, 0)
+    n_arm_segs = len(ref_segs)
 
     for i, (xs, ys) in enumerate(segments):
         if i == len(segments) - 1:
             # COM marker (last segment is a single point)
             ax.plot(xs[0], ys[0], "D", color="#0891b2", markersize=6, alpha=alpha)
-        else:
-            ax.plot(xs, ys, color=seg_colors[i], linewidth=seg_widths[i],
-                    linestyle=seg_styles[i], alpha=alpha)
+        elif i == 0:
+            # Body line
+            ax.plot(xs, ys, color="#6b7280", linewidth=4, alpha=alpha,
+                    solid_capstyle="round")
+        elif 1 <= i <= n_arm_segs:
+            # Grip arm segments
+            seg_info = ref_segs[i - 1]
+            ax.plot(xs, ys, color=seg_info['color'],
+                    linewidth=seg_info['width'], linestyle=seg_info['style'],
+                    alpha=alpha)
+        elif n_arm_segs + 1 <= i <= 2 * n_arm_segs:
+            # Free arm segments
+            seg_info = ref_segs[i - n_arm_segs - 1]
+            ax.plot(xs, ys, color=seg_info['color'],
+                    linewidth=seg_info['width'], linestyle=seg_info['style'],
+                    alpha=alpha * 0.7)
+        elif i == 2 * n_arm_segs + 1:
+            # Body box
+            ax.plot(xs, ys, color="#4b5563", linewidth=2, alpha=alpha)
+        elif i == 2 * n_arm_segs + 2:
+            # Tail
+            ax.plot(xs, ys, color="#d97706", linewidth=3, alpha=alpha)
+
+    # Draw mesh outlines if requested
+    if show_meshes and alpha > 0.5:  # only for visible waypoints
+        state = info["state"]
+        t1g, t2g, t1f, t2f, _ = unpack_state(state)
+        gs = info["grip_shoulder"]
+        fs = info["free_shoulder"]
+        grip_is_left = not grip_is_right
+
+        # Grip arm meshes
+        grip_outlines = mesh_outlines_2d(
+            t1g, t2g, gs,
+            side='left' if grip_is_left else 'right',
+            is_mirrored=grip_is_left)
+        for hx, hy, name in grip_outlines:
+            ax.fill(hx, hy, color="#5fb3ff", alpha=0.08 * alpha, linewidth=0)
+            ax.plot(hx, hy, color="#5fb3ff", linewidth=0.5, alpha=0.3 * alpha)
+
+        # Free arm meshes
+        free_is_left = not grip_is_left
+        free_outlines = mesh_outlines_2d(
+            t1f, t2f, fs,
+            side='left' if free_is_left else 'right',
+            is_mirrored=free_is_left)
+        for hx, hy, name in free_outlines:
+            ax.fill(hx, hy, color="#ff9f5f", alpha=0.08 * alpha, linewidth=0)
+            ax.plot(hx, hy, color="#ff9f5f", linewidth=0.5, alpha=0.3 * alpha)
 
 
 def visualise_trajectory(X_opt, infos, bar1_x, bar2_x, bar_y,
@@ -405,6 +824,21 @@ def visualise_trajectory(X_opt, infos, bar1_x, bar2_x, bar_y,
     ax.set_ylabel("Y (m)")
     ax.set_title("Planned Trajectory (ghost poses)")
 
+    # Zoom to fit the trajectory tightly
+    all_gt_x = [info["free_gripper_tip"][0] for info in infos]
+    all_gt_y = [info["free_gripper_tip"][1] for info in infos]
+    all_gs_x = [info["grip_shoulder"][0] for info in infos]
+    all_gs_y = [info["grip_shoulder"][1] for info in infos]
+    all_fs_x = [info["free_shoulder"][0] for info in infos]
+    all_fs_y = [info["free_shoulder"][1] for info in infos]
+    pad = 0.12
+    x_lo = min(min(all_gt_x), min(all_gs_x), min(all_fs_x), bar1_x) - pad
+    x_hi = max(max(all_gt_x), max(all_gs_x), max(all_fs_x), bar2_x) + pad
+    y_lo = min(min(all_gt_y), min(all_gs_y), min(all_fs_y)) - pad
+    y_hi = max(bar_y, max(all_gt_y)) + pad
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+
     # Bars
     bar_half = 0.04
     for bx, label in [(bar1_x, "Bar 1"), (bar2_x, "Bar 2")]:
@@ -413,16 +847,22 @@ def visualise_trajectory(X_opt, infos, bar1_x, bar2_x, bar_y,
         ax.text(bx, bar_y + bar_half + 0.01, label, ha="center", fontsize=9)
 
     n = len(infos)
+    show_meshes = False  # mesh outlines disabled for now
     for k, info in enumerate(infos):
         alpha = 0.15 + 0.85 * (k / max(n - 1, 1))
         draw_robot_at_waypoint(ax, info, grip_is_right, L1, L2, alpha=alpha,
-                               bar_pos=(bar1_x, bar_y))
+                               bar_pos=None, show_meshes=show_meshes)
+        # Mark colliding waypoints with a red X
+        if not info.get("collision_safe", True):
+            gt = info["free_gripper_tip"]
+            ax.plot(gt[0], gt[1], "x", color="red", markersize=12,
+                    markeredgewidth=2.5, alpha=alpha)
 
     # Draw reference hook trajectory (smooth Gaussian dip near bar 2)
     arc_t = np.linspace(0, 1, 80)
-    dip_depth = 3.0 * INCH_TO_M
-    dip_center = 0.65
-    sigma = 0.25
+    dip_depth = 8.0 * INCH_TO_M
+    dip_center = 0.50
+    sigma = 0.35
     arc_xs = [bar1_x + (bar2_x - bar1_x) * (0.5 - 0.5 * math.cos(t * math.pi))
               for t in arc_t]
     arc_ys = [bar_y - dip_depth * math.exp(-0.5 * ((t - dip_center) / sigma) ** 2)
@@ -431,23 +871,15 @@ def visualise_trajectory(X_opt, infos, bar1_x, bar2_x, bar_y,
             alpha=0.6, label="Reference path")
 
     # Draw COM and gripper tip paths (tilted)
-    grip_point = (bar1_x, bar_y)
-    com_xs_t = []
-    com_ys_t = []
-    gt_xs_t = []
-    gt_ys_t = []
-    for info in infos:
-        segs = get_robot_segments(info, grip_is_right, L1, L2, bar_pos=grip_point)
-        # Last segment = COM point
-        com_xs_t.append(segs[-1][0][0])
-        com_ys_t.append(segs[-1][1][0])
-        # Segment 4 = free gripper, last point = tip
-        gt_xs_t.append(segs[4][0][-1])
-        gt_ys_t.append(segs[4][1][-1])
+    # COM and gripper tip paths (no tilt — body stays horizontal)
+    com_xs = [info["com"][0] for info in infos]
+    com_ys = [info["com"][1] for info in infos]
+    gt_xs = [info["free_gripper_tip"][0] for info in infos]
+    gt_ys = [info["free_gripper_tip"][1] for info in infos]
 
-    ax.plot(com_xs_t, com_ys_t, "o-", color="#0891b2", markersize=4,
-            linewidth=1.5, label="COM path (tilted)")
-    ax.plot(gt_xs_t, gt_ys_t, "x-", color="#f59e0b", markersize=6,
+    ax.plot(com_xs, com_ys, "o-", color="#0891b2", markersize=4,
+            linewidth=1.5, label="COM path")
+    ax.plot(gt_xs, gt_ys, "x-", color="#f59e0b", markersize=6,
             linewidth=1.5, label="Free gripper tip path")
 
     # COM tolerance band
@@ -762,12 +1194,12 @@ class ReplanningController:
         else:
             wp = self.trajectory[self.current_wp]
 
-        tg, pg, tf, pf, td = unpack_state(wp)
+        t1g, t2g, t1f, t2f, td = unpack_state(wp)
         return {
-            "grip_shoulder_motor_deg": theta_to_motor(tg),
-            "grip_elbow_motor_deg": phi_to_motor(pg),
-            "free_shoulder_motor_deg": theta_to_motor(tf),
-            "free_elbow_motor_deg": phi_to_motor(pf),
+            "grip_shoulder_motor_deg": t1g,
+            "grip_elbow_motor_deg": t2g,
+            "free_shoulder_motor_deg": t1f,
+            "free_elbow_motor_deg": t2f,
             "tail_gui_deg": td,
         }
 
@@ -845,7 +1277,7 @@ def get_robot_segments(info, grip_is_right, L1, L2, bar_pos=None):
     fs = info["free_shoulder"]
     com = info["com"]
     state = info["state"]
-    theta_g, phi_g, theta_f, phi_f, tail_deg = unpack_state(state)
+    t1g, t2g, t1f, t2f, tail_deg = unpack_state(state)
 
     if grip_is_right:
         r_sh, l_sh = gs, fs
@@ -857,27 +1289,29 @@ def get_robot_segments(info, grip_is_right, L1, L2, bar_pos=None):
     # Body (line between shoulders)
     segments.append(([r_sh[0], l_sh[0]], [r_sh[1], l_sh[1]]))
 
-    # Gripping arm
-    gx, gy = forward_kinematics_2link(phi_g, theta_g, L1, L2)
-    gx_w = gx + gs[0]
-    gy_w = gy + gs[1]
-    segments.append((gx_w.tolist(), gy_w.tolist()))
-    # Grip gripper (vertical)
-    segments.append(([gx_w[-1], gx_w[-1]],
-                     [gy_w[-1], gy_w[-1] + GRIPPER_DRAW_LENGTH]))
+    # Gripping arm — full Willy double-parallelogram drawing.
+    # Mirror x if the gripping arm is the LEFT arm (same as HTML's scale(-1,1)).
+    grip_segs, _ = willy_arm_segments(t1g, t2g)
+    grip_is_left = not grip_is_right
+    for seg in grip_segs:
+        if grip_is_left:
+            xs = [gs[0] - x for x in seg['xs']]
+        else:
+            xs = [gs[0] + x for x in seg['xs']]
+        ys = [gs[1] + y for y in seg['ys']]
+        segments.append((xs, ys))
 
-    # Free arm
-    fx_local, fy_local = forward_kinematics_2link(phi_f, theta_f, L1, L2)
+    # Free arm — mirror x if the free arm is the LEFT arm.
+    free_segs, _ = willy_arm_segments(t1f, t2f)
     free_is_right = not grip_is_right
-    if free_is_right:
-        fx_w = fx_local + fs[0]
-    else:
-        fx_w = -fx_local + fs[0]
-    fy_w = fy_local + fs[1]
-    segments.append((list(fx_w), list(fy_w)))
-    # Free gripper (vertical)
-    segments.append(([fx_w[-1], fx_w[-1]],
-                     [fy_w[-1], fy_w[-1] + GRIPPER_DRAW_LENGTH]))
+    free_is_left = not free_is_right
+    for seg in free_segs:
+        if free_is_left:
+            xs = [fs[0] - x for x in seg['xs']]
+        else:
+            xs = [fs[0] + x for x in seg['xs']]
+        ys = [fs[1] + y for y in seg['ys']]
+        segments.append((xs, ys))
 
     # Body box: rectangle centered between shoulders, dropping down
     body_cx = (r_sh[0] + l_sh[0]) / 2.0
@@ -945,12 +1379,28 @@ def animate_trajectory_3d(X_opt, infos, bar1_x, bar2_x, bar_y,
                             linewidth=0.5)
     ax.add_collection3d(band)
 
-    # Prepare line objects for animation (all in the z=0 plane)
-    # Segments: body, grip arm, grip gripper, free arm, free gripper, body box, tail
-    colors = ["#6b7280", "#0f766e", "#7c3aed", "#16a34a", "#7c3aed", "#4b5563", "#d97706"]
-    widths = [4, 3, 2, 3, 2, 2, 3]
-    styles = ["-", "-", "--", "-", "--", "-", "-"]
-    n_segs = 7
+    # Prepare line objects for animation (all in the z=0 plane).
+    # Segment count: 1 body + 8 grip arm + 8 free arm + 1 body box + 1 tail = 19
+    # (COM point is handled separately as a marker)
+    ref_segs, _ = willy_arm_segments(0, 0)
+    n_arm_segs = len(ref_segs)
+    n_segs = 1 + n_arm_segs + n_arm_segs + 1 + 1  # 19
+
+    # Build color/width/style arrays
+    colors = ["#6b7280"]  # body
+    widths = [4]
+    styles = ["-"]
+    for seg in ref_segs:  # grip arm
+        colors.append(seg['color'])
+        widths.append(seg['width'])
+        styles.append(seg['style'])
+    for seg in ref_segs:  # free arm
+        colors.append(seg['color'])
+        widths.append(seg['width'])
+        styles.append(seg['style'])
+    colors += ["#4b5563", "#d97706"]  # body box, tail
+    widths += [2, 3]
+    styles += ["-", "-"]
 
     lines_3d = []
     for i in range(n_segs):
@@ -989,16 +1439,12 @@ def animate_trajectory_3d(X_opt, infos, bar1_x, bar2_x, bar_y,
 
     def update(frame):
         info = infos[frame]
-        grip_point = (bar1_x, bar_y)
         segments = get_robot_segments(info, grip_is_right, L1, L2,
-                                     bar_pos=grip_point)
-        # Last segment is the tilted COM point
-        tilted_com_x = segments[-1][0][0]
-        tilted_com_y = segments[-1][1][0]
-        # Free gripper tip (segment 4 = free gripper, last point)
-        fh_x = segments[4][0][-1]
-        fh_y = segments[4][1][-1]
-        fh = np.array([fh_x, fh_y])
+                                     bar_pos=None)  # body stays horizontal
+        # Last segment = COM point (no tilt)
+        com_x = segments[-1][0][0]
+        com_y = segments[-1][1][0]
+        fh = info["free_gripper_tip"]
 
         n_draw = len(segments) - 1  # skip COM point segment
         for i in range(min(n_draw, len(lines_3d))):
@@ -1006,10 +1452,10 @@ def animate_trajectory_3d(X_opt, infos, bar1_x, bar2_x, bar_y,
             zs = [0.0] * len(xs)
             lines_3d[i].set_data_3d(xs, ys, zs)
 
-        com_dot.set_data_3d([tilted_com_x], [tilted_com_y], [0.0])
+        com_dot.set_data_3d([com_x], [com_y], [0.0])
 
-        com_history_x.append(com[0])
-        com_history_y.append(com[1])
+        com_history_x.append(com_x)
+        com_history_y.append(com_y)
         com_trail.set_data_3d(com_history_x, com_history_y,
                               [0.0] * len(com_history_x))
 
@@ -1018,15 +1464,13 @@ def animate_trajectory_3d(X_opt, infos, bar1_x, bar2_x, bar_y,
         fh_trail.set_data_3d(fh_history_x, fh_history_y,
                              [0.0] * len(fh_history_x))
 
-        tg, pg, tf, pf, td = unpack_state(info["state"])
+        t1g, t2g, t1f, t2f, td = unpack_state(info["state"])
         info_text.set_text(
             f"WP {frame}/{len(infos)-1}\n"
             f"gripper tip: ({fh[0]:+.3f}, {fh[1]:+.3f}) m\n"
-            f"COM_x offset: {(com[0]-bar1_x)*1000:+.1f} mm\n"
-            f"grip_sh: {theta_to_motor(tg):+.1f}°  "
-            f"grip_el: {phi_to_motor(pg):+.1f}°\n"
-            f"free_sh: {theta_to_motor(tf):+.1f}°  "
-            f"free_el: {phi_to_motor(pf):+.1f}°\n"
+            f"COM_x offset: {(com_x-bar1_x)*1000:+.1f} mm\n"
+            f"grip: t1={t1g:+.1f}° t2={t2g:+.1f}°\n"
+            f"free: t1={t1f:+.1f}° t2={t2f:+.1f}°\n"
             f"tail: {td:+.1f}°"
         )
 
@@ -1065,6 +1509,8 @@ def main():
                         help="Simulated IMU noise std dev in degrees (default 2.0)")
     parser.add_argument("--replan-threshold", type=float, default=5.0,
                         help="Tilt error threshold to trigger replan in degrees (default 5.0)")
+    parser.add_argument("--collision", action="store_true",
+                        help="Check mesh collisions at each waypoint and show in viz")
     args = parser.parse_args()
 
     spacing_m = args.bar_spacing * INCH_TO_M
@@ -1095,21 +1541,39 @@ def main():
     # Print summary
     print("\n── Trajectory summary ──")
     for k, info in enumerate(infos):
-        tg, pg, tf, pf, td = unpack_state(info["state"])
+        t1g, t2g, t1f, t2f, td = unpack_state(info["state"])
         gt = info["free_gripper_tip"]
         com = info["com"]
         print(f"  WP {k:2d}:  gripper_tip=({gt[0]:+.3f}, {gt[1]:+.3f}) m  "
               f"COM_x={com[0]:+.4f} m  "
-              f"grip_sh={theta_to_motor(tg):+6.1f}°  "
-              f"grip_el={phi_to_motor(pg):+6.1f}°  "
-              f"free_sh={theta_to_motor(tf):+6.1f}°  "
-              f"free_el={phi_to_motor(pf):+6.1f}°  "
+              f"grip=({t1g:+6.1f}°,{t2g:+6.1f}°)  "
+              f"free=({t1f:+6.1f}°,{t2f:+6.1f}°)  "
               f"tail={td:+5.1f}°")
 
     final_gt = infos[-1]["free_gripper_tip"]
     bar2 = np.array([bar2_x, bar_y])
     miss = np.linalg.norm(final_gt - bar2)
     print(f"\nFinal gripper-tip miss from bar 2: {miss*1000:.1f} mm")
+
+    # ── Collision check ──────────────────────────────────────────────
+    if args.collision:
+        print("\n── Collision check ──")
+        n_collisions = 0
+        for k, info in enumerate(infos):
+            t1g, t2g, t1f, t2f, td = unpack_state(info["state"])
+            safe, contacts = check_collision_at_waypoint(
+                t1g, t2g, t1f, t2f, td, grip_is_right=grip_is_right)
+            info["collision_safe"] = safe
+            info["collision_contacts"] = contacts
+            status = "OK" if safe else f"COLLISION {contacts}"
+            if not safe:
+                n_collisions += 1
+            print(f"  WP {k:2d}: {status}")
+        print(f"  {n_collisions}/{len(infos)} waypoints have collisions")
+    else:
+        for info in infos:
+            info["collision_safe"] = True
+            info["collision_contacts"] = []
 
     # ── Closed-loop demo ──────────────────────────────────────────────
     if args.closed_loop:
