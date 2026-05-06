@@ -1,0 +1,29 @@
+(base) orin@orin:~/brachiation-ik-main$ sudo /home/orin/miniforge3/bin/python3 brachiation_planner.py --execute --grip left --mpc
+ 
+[motor_reader] can2 skipped (motors [20]): Adapter not found (serial 0049002A5034570520323530). Connected serials: ['0048002B4730511220303650', '004B00365034570520323530']
+Run: sudo .venv/bin/python list_adapters.py
+Waiting for first motor readings...
+
+Limits (state-deg):
+  right shoulder: (-13.708000000000006, 46.0)
+  right elbow:    (-36.348, 138.769)
+  left shoulder:  (-8.815000000000005, 70.9)
+  left elbow:     (-58.443, 90.4)
+
+Starting state (current measured pose):
+  t1_grip=+28.95°  t2_grip=+48.74°  t1_free=+44.03°  t2_free=+77.67°
+
+Planning trajectory from current pose...
+Optimising 12 waypoints × 5 DOF = 60 variables …
+Optimization terminated successfully    (Exit mode 0)
+            Current function value: 3.044516036061225
+            Iterations: 28
+            Function evaluations: 1272
+            Gradient evaluations: 28
+Optimiser exit: Optimization terminated successfully  (success=True)
+
+Trajectory: 12 waypoints, step=1.00s, total ~12.0s
+Gains: Kp=5.0 Kd=0.5 TorqueFF=0.0
+Motors to drive: [1, 2, 16, 18]
+
+Enable motors and execute? [y/N]: Aborted.
