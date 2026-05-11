@@ -174,15 +174,6 @@ def get_collision_model():
     return _collision_model
 
 
-# Inter-arm pairs that always overlap due to shared bilateral base structure
-_INTER_ARM_SKIP = {
-    frozenset(['base', 'base']),
-    frozenset(['base', 'Component139']),
-    frozenset(['base', 'Component148']),
-    frozenset(['base', 'Component151']),
-}
-
-
 def check_collision_at_waypoint(t1_grip_deg, t2_grip_deg, t1_free_deg, t2_free_deg,
                                  tail_deg=0.0, grip_is_right=False):
     """Check collision for a single waypoint using the mesh model.
@@ -378,6 +369,96 @@ _M2_OFFSET    = np.array([7.62, -3.493]) / 100.0   # M2 base pivot offset from M
 _COMP151_DISTAL = np.array([7.62, 0.0]) / 100.0    # Comp151 distal corner from elbow
 _COMP151_PURPLE = np.array([7.62, -3.493]) / 100.0 # Comp151 purple corner from elbow
 _EE_LENGTH    = 0.06                       # 6 cm end-effector above wrist plate
+
+
+# ── Geometric collision dimensions ───────────────────────────────────────────
+# Distances in metres. Used both for the planner's collision constraints
+# and for the visualisation overlay.
+INCH_M            = 0.0254
+LINK_HALF_WIDTH_M = 0.625 * INCH_M    # parallelogram links: 1.25" wide
+LINK_RADIUS_M     = LINK_HALF_WIDTH_M  # alias for capsule-capsule distances
+DISC_RADIUS_M     = 2.0  * INCH_M     # 4" diameter wrist-plate disc → 2" radius
+BAR_RADIUS_M      = 0.5  * INCH_M     # treat bars as 1" diameter cylinders
+
+
+def _inflate_segment_polygon(p1, p2, half_width):
+    """Return 4 vertices of a rectangle around segment p1→p2, half_width on
+    each side perpendicular to the segment. p1, p2 are (x, y) tuples or
+    1D arrays."""
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+    dx, dy = x2 - x1, y2 - y1
+    L = math.sqrt(dx * dx + dy * dy)
+    if L < 1e-9:
+        return [(x1, y1), (x1, y1), (x2, y2), (x2, y2)]
+    nx, ny = -dy / L, dx / L          # unit normal
+    hw = half_width
+    return [(x1 + hw * nx, y1 + hw * ny),
+            (x2 + hw * nx, y2 + hw * ny),
+            (x2 - hw * nx, y2 - hw * ny),
+            (x1 - hw * nx, y1 - hw * ny)]
+
+
+def arm_collision_polygons(t1_deg, t2_deg, shoulder_world, side_is_left,
+                            half_width_m=LINK_HALF_WIDTH_M,
+                            disc_radius_m=DISC_RADIUS_M):
+    """Return a list of (polygon_vertices, kind) tuples representing the
+    physical extents of one arm in the world frame. `kind` is one of
+    {'link', 'triangle', 'plate', 'disc'} for visual styling.
+
+    polygon_vertices is a list of (x, y) world-frame points.
+    """
+    a1  = (t1_deg + K1) * _D2R
+    a12 = a1 + (t2_deg + K2) * _D2R
+
+    # All positions in arm-local frame.
+    M1 = np.array([0.0, 0.0])
+    M2 = _M2_OFFSET.copy()
+    elbow = np.array([A_M * math.cos(a1), A_M * math.sin(a1)])
+    J_orange = elbow.copy()
+    J_distal = elbow + _COMP151_DISTAL
+    J_purple = elbow + _COMP151_PURPLE
+    J4 = elbow + np.array([_FOREARM_DRAW * math.cos(a12),
+                            _FOREARM_DRAW * math.sin(a12)])
+    J7 = J4 + np.array([_WRIST_PLATE, 0.0])
+    ee_base = (J4 + J7) / 2.0
+
+    # Map each local point into the world frame (mirror x for left arm).
+    sx = -1.0 if side_is_left else 1.0
+    sh = np.asarray(shoulder_world, dtype=float)
+    def W(p):
+        return (sh[0] + sx * float(p[0]), sh[1] + float(p[1]))
+
+    polys = []
+
+    # 1. Comp139 upper arm (M1 → elbow).
+    polys.append((_inflate_segment_polygon(W(M1), W(elbow), half_width_m),
+                  "link"))
+    # 2. Comp148 passive rod (M2 → J_purple).
+    polys.append((_inflate_segment_polygon(W(M2), W(J_purple), half_width_m),
+                  "link"))
+    # 3. Comp151 triangle — filled.
+    polys.append(([W(J_orange), W(J_purple), W(J_distal)], "triangle"))
+    # 4. Comp146 forearm (elbow → J4).
+    polys.append((_inflate_segment_polygon(W(elbow), W(J4), half_width_m),
+                  "link"))
+    # 5. Comp147 passive rod (J_distal → J7).
+    polys.append((_inflate_segment_polygon(W(J_distal), W(J7), half_width_m),
+                  "link"))
+    # 6. Comp143 wrist plate (J4 → J7).
+    polys.append((_inflate_segment_polygon(W(J4), W(J7), half_width_m),
+                  "plate"))
+    # 7. Disc at ee_base — runs PERPENDICULAR to the gripper end-effector
+    #    (which is vertical in body frame), so in 2D it's a horizontal line
+    #    of length 2*R centered on ee_base.
+    eb = W(ee_base)
+    disc_left  = (eb[0] - disc_radius_m, eb[1])
+    disc_right = (eb[0] + disc_radius_m, eb[1])
+    polys.append((_inflate_segment_polygon(disc_left, disc_right,
+                                            0.005),  # 1 cm visual thickness
+                  "disc"))
+
+    return polys
 
 
 def willy_arm_segments(t1_deg, t2_deg):
@@ -964,16 +1045,613 @@ def plan_trajectory(
     return X_opt, infos, result
 
 
+def _point_seg_dist_sq(p, q1, q2):
+    """Squared min distance from 2D point p to segment q1→q2."""
+    d = q2 - q1
+    L2 = float(d[0] * d[0] + d[1] * d[1])
+    if L2 < 1e-18:
+        dx, dy = p[0] - q1[0], p[1] - q1[1]
+        return dx * dx + dy * dy
+    t = float((p[0] - q1[0]) * d[0] + (p[1] - q1[1]) * d[1]) / L2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    cx = q1[0] + t * d[0]
+    cy = q1[1] + t * d[1]
+    dx, dy = p[0] - cx, p[1] - cy
+    return dx * dx + dy * dy
+
+
+def _seg_seg_dist_sq(p1, p2, q1, q2):
+    """Squared min distance between two 2D segments."""
+    d1x, d1y = p2[0] - p1[0], p2[1] - p1[1]
+    d2x, d2y = q2[0] - q1[0], q2[1] - q1[1]
+    denom = d1x * d2y - d1y * d2x
+    if abs(denom) > 1e-12:
+        rx, ry = q1[0] - p1[0], q1[1] - p1[1]
+        s = (rx * d2y - ry * d2x) / denom
+        t = (rx * d1y - ry * d1x) / denom
+        if 0.0 <= s <= 1.0 and 0.0 <= t <= 1.0:
+            return 0.0
+    return min(
+        _point_seg_dist_sq(p1, q1, q2),
+        _point_seg_dist_sq(p2, q1, q2),
+        _point_seg_dist_sq(q1, p1, p2),
+        _point_seg_dist_sq(q2, p1, p2),
+    )
+
+
+def _arm_landmarks(state_rad, grip_is_right, bar1):
+    """Return key kinematic points (world frame) for both arms, given
+    a planner state vector in radians.
+
+    Returns dict with arrays for: grip_shoulder, grip_elbow, grip_J4,
+    grip_J7, grip_disc, free_shoulder, free_elbow, free_J4, free_J7,
+    free_disc. Positions follow the same conventions used elsewhere in
+    the planner (right arm: +x = world +x; left arm mirrored).
+    """
+    t1g_r, t2g_r, t1f_r, t2f_r, _ttail = (float(s) for s in state_rad)
+    t1g, t2g = math.degrees(t1g_r), math.degrees(t2g_r)
+    t1f, t2f = math.degrees(t1f_r), math.degrees(t2f_r)
+
+    grip_sh = shoulder_from_bar(bar1, t1g, t2g,
+                                grip_is_left=not grip_is_right)
+    _, free_sh = body_and_free_shoulder(grip_sh, grip_is_right)
+
+    def _local_arm_points(t1_deg, t2_deg):
+        a1 = math.radians(t1_deg + K1)
+        a12 = a1 + math.radians(t2_deg + K2)
+        elbow = np.array([A_M * math.cos(a1), A_M * math.sin(a1)])
+        j4 = elbow + np.array([_FOREARM_DRAW * math.cos(a12),
+                                _FOREARM_DRAW * math.sin(a12)])
+        j7 = j4 + np.array([_WRIST_PLATE, 0.0])
+        disc = (j4 + j7) / 2.0
+        m2       = _M2_OFFSET.copy()
+        j_purple = elbow + _COMP151_PURPLE
+        j_distal = elbow + _COMP151_DISTAL
+        return elbow, j4, j7, disc, m2, j_purple, j_distal
+
+    (g_elbow, g_j4, g_j7, g_disc,
+     g_m2, g_j_purple, g_j_distal) = _local_arm_points(t1g, t2g)
+    (f_elbow, f_j4, f_j7, f_disc,
+     f_m2, f_j_purple, f_j_distal) = _local_arm_points(t1f, t2f)
+
+    # Mirror the left arm's local x → world: left x_local = -x_world_offset.
+    def _to_world(local, shoulder_world, side_is_left):
+        if side_is_left:
+            return shoulder_world + np.array([-local[0], local[1]])
+        return shoulder_world + local
+
+    grip_is_left = not grip_is_right
+    free_is_left = grip_is_right
+
+    return {
+        "grip_shoulder": np.asarray(grip_sh, dtype=float),
+        "grip_M2":       _to_world(g_m2,       grip_sh, grip_is_left),
+        "grip_elbow":    _to_world(g_elbow,    grip_sh, grip_is_left),
+        "grip_J_purple": _to_world(g_j_purple, grip_sh, grip_is_left),
+        "grip_J_distal": _to_world(g_j_distal, grip_sh, grip_is_left),
+        "grip_J4":       _to_world(g_j4,       grip_sh, grip_is_left),
+        "grip_J7":       _to_world(g_j7,       grip_sh, grip_is_left),
+        "grip_disc":     _to_world(g_disc,     grip_sh, grip_is_left),
+        "free_shoulder": np.asarray(free_sh, dtype=float),
+        "free_M2":       _to_world(f_m2,       free_sh, free_is_left),
+        "free_elbow":    _to_world(f_elbow,    free_sh, free_is_left),
+        "free_J_purple": _to_world(f_j_purple, free_sh, free_is_left),
+        "free_J_distal": _to_world(f_j_distal, free_sh, free_is_left),
+        "free_J4":       _to_world(f_j4,       free_sh, free_is_left),
+        "free_J7":       _to_world(f_j7,       free_sh, free_is_left),
+        "free_disc":     _to_world(f_disc,     free_sh, free_is_left),
+    }
+
+
+# ── Minimal planner: no path prescription, tail unlocked ─────────────────────
+
+def plan_trajectory_minimal(
+    bar1_x, bar2_x, bar_y,
+    grip_is_right=True,
+    n_waypoints=12,
+    L1=LINK1_LENGTH, L2=LINK2_LENGTH,
+    right_shoulder_lim=(-70.9, 46.0),
+    right_elbow_lim=(-90.4, 140.0),
+    left_shoulder_lim=(-46.0, 70.9),
+    left_elbow_lim=(-140.0, 90.4),
+    tail_lim=(-60.0, 60.0),       # tail UNLOCKED — counterweight is free
+    smoothness_weight=1.0,
+    monotone_x=True,
+    start_state_deg=None,
+    bar_clearance_m=0.02,         # min y-clearance below bar2 except at catch
+    com_band_m=0.03,              # |COM_x - bar1_x| during the direct phase
+    com_band_late_m=0.05,         # |COM_x - bar1_x| during the dip/catch phase
+    com_relax_t=0.70,             # 0..1; t at which COM band starts widening
+    pin_wp0=False,                # pin WP0 to start_state_deg (or default)
+    track_weight=20.0,            # soft tracking cost weight on Cartesian target
+    dip_depth_m=0.10,             # peak dip depth (m below bar)
+    dip_skew_k=4.0,               # >1 shifts the dip peak late (sin(π·t^k))
+    enable_collision=True,        # geometric collision constraints (link/disc/bar)
+):
+    """U-shape brachiation reach: dip below bars, traverse, rise to catch.
+
+    Free hand follows a Cartesian U-curve from start to bar2:
+        x(t) = bar1_x + (bar2_x - bar1_x) · smoothstep(t)
+        y(t) = bar_y - dip_depth · sin(π·t)^p
+    Tracking is a SOFT cost (weight `track_weight`); the optimizer is free
+    to deviate when joint geometry or COM band makes exact tracking
+    infeasible.
+
+    Hard constraints:
+      • Final waypoint: free gripper tip exactly at bar 2.
+      • Every waypoint: COM_x within ±com_band_m of bar1_x.
+      • Every waypoint except final: free_hand_y ≤ bar_y − bar_clearance_m
+        (gripper catches from below, so it must stay under the bars).
+      • Monotone free_hand_x progression (no backtracking).
+      • Joint bounds (incl. unlocked tail).
+    """
+    bar1 = np.array([bar1_x, bar_y])
+    bar2 = np.array([bar2_x, bar_y])
+
+    free_is_right = not grip_is_right
+
+    if grip_is_right:
+        grip_t1_lim = right_shoulder_lim
+        grip_t2_lim = right_elbow_lim
+        free_t1_lim = left_shoulder_lim
+        free_t2_lim = left_elbow_lim
+    else:
+        grip_t1_lim = left_shoulder_lim
+        grip_t2_lim = left_elbow_lim
+        free_t1_lim = right_shoulder_lim
+        free_t2_lim = right_elbow_lim
+
+    def deg_to_rad_bounds(lim):
+        return (math.radians(lim[0]), math.radians(lim[1]))
+
+    per_wp_bounds = [
+        deg_to_rad_bounds(grip_t1_lim),
+        deg_to_rad_bounds(grip_t2_lim),
+        deg_to_rad_bounds(free_t1_lim),
+        deg_to_rad_bounds(free_t2_lim),
+        deg_to_rad_bounds(tail_lim),
+    ]
+
+    # Two-stage solve when collisions are enabled: stage 1 solves without
+    # collision constraints to get a smooth U trajectory, then stage 2
+    # warm-starts from it with the full collision set. WP 0 is pinned to
+    # a known non-colliding starting pose so stage 1 cannot drift into a
+    # collision at the start.
+    NON_COLLIDING_WP0 = (70.0, 65.0, -6.0, 136.0, 0.0)
+    if enable_collision:
+        wp0_for_pin = (start_state_deg if start_state_deg is not None
+                        else NON_COLLIDING_WP0)
+        print(f"[minimal] Stage 1: warm start with WP0 pinned to "
+              f"{tuple(round(v,1) for v in wp0_for_pin)} (non-colliding) …")
+        X_warm, _infos_w, _res_w = plan_trajectory_minimal(
+            bar1_x, bar2_x, bar_y,
+            grip_is_right=grip_is_right,
+            n_waypoints=n_waypoints,
+            L1=L1, L2=L2,
+            right_shoulder_lim=right_shoulder_lim,
+            right_elbow_lim=right_elbow_lim,
+            left_shoulder_lim=left_shoulder_lim,
+            left_elbow_lim=left_elbow_lim,
+            tail_lim=tail_lim,
+            smoothness_weight=smoothness_weight,
+            monotone_x=monotone_x,
+            start_state_deg=wp0_for_pin,
+            bar_clearance_m=bar_clearance_m,
+            com_band_m=com_band_m,
+            com_band_late_m=com_band_late_m,
+            com_relax_t=com_relax_t,
+            pin_wp0=True,                # pin WP0 to wp0_for_pin
+            track_weight=track_weight,
+            dip_depth_m=dip_depth_m,
+            dip_skew_k=dip_skew_k,
+            enable_collision=False,
+        )
+        x0 = X_warm.reshape(-1).copy()
+        x0_single = x0[:STATE_DIM]
+        # Carry the WP0 pin into stage 2 so collisions can never re-enter
+        # at the start.
+        if start_state_deg is None:
+            start_state_deg = wp0_for_pin
+        pin_wp0 = True
+    else:
+        # Cold start: linearly interpolate in joint space between a
+        # "swing-start" pose and a "catch" pose. Both verified to satisfy
+        # all collision constraints (free arm clear of grip arm) and are
+        # near the COM band centre.
+        swing_start = (70.0, 65.0, -6.0, 136.0, 0.0)
+        catch_pose  = (69.0, 84.0, -50.0, 109.0, -25.0)
+        if start_state_deg is not None:
+            swing_start = tuple(start_state_deg)
+        x0 = np.zeros(n_waypoints * STATE_DIM)
+        for k in range(n_waypoints):
+            s = k / max(n_waypoints - 1, 1)
+            wp = tuple(swing_start[j] * (1 - s) + catch_pose[j] * s
+                       for j in range(STATE_DIM))
+            x0[k * STATE_DIM:(k + 1) * STATE_DIM] = pack_state(*wp)
+        x0_single = x0[:STATE_DIM]
+
+    bounds = list(per_wp_bounds * n_waypoints)
+    if pin_wp0 and start_state_deg is not None:
+        # User pinned the start — pin WP0 to it exactly.
+        x0_pin = pack_state(*start_state_deg)
+        clamped = list(x0_pin)
+        for j in range(STATE_DIM):
+            lo, hi = per_wp_bounds[j]
+            clamped[j] = max(lo, min(hi, clamped[j]))
+            bounds[j] = (float(clamped[j]), float(clamped[j]))
+
+    def free_tip(state):
+        t1g, t2g, t1f, t2f, _td = unpack_state(state)
+        grip_sh = shoulder_from_bar(bar1, t1g, t2g,
+                                    grip_is_left=not grip_is_right)
+        _, free_sh = body_and_free_shoulder(grip_sh, grip_is_right)
+        return free_hand_world(free_sh, t1f, t2f, free_is_left=grip_is_right)
+
+    # Cartesian target schedule for the free hand:
+    #  • x progresses smoothstep from bar1 to bar2.
+    #  • y stays just below the bar (at bar_clearance_m) for the direct
+    #    phase, then dips deeper near the catch via sin(π·t^k). Larger k
+    #    pushes the dip peak later (k=4 → peak near t≈0.84).
+    targets = []
+    for k in range(n_waypoints):
+        t = k / max(n_waypoints - 1, 1)
+        s = t * t * (3.0 - 2.0 * t)                       # smoothstep(t)
+        x_t = bar1_x + (bar2_x - bar1_x) * s
+        bump = max(math.sin(math.pi * (t ** dip_skew_k)), 0.0)
+        # Baseline = clearance below bar; bump adds extra dip (max=dip_depth_m).
+        extra = max(dip_depth_m - bar_clearance_m, 0.0) * bump
+        y_t = bar_y - bar_clearance_m - extra
+        targets.append((x_t, y_t))
+    targets[-1] = (bar2_x, bar_y)                         # exact catch
+
+    def cost(x_flat):
+        X = x_flat.reshape(n_waypoints, STATE_DIM)
+        diffs = X[1:] - X[:-1]
+        c = smoothness_weight * float(np.sum(diffs * diffs))
+        for k in range(n_waypoints):
+            tip = free_tip(X[k])
+            tx, ty = targets[k]
+            c += track_weight * ((tip[0] - tx) ** 2 + (tip[1] - ty) ** 2)
+        return float(c)
+
+    constraints = []
+
+    # Per-waypoint COM band: tight in the direct phase, loose during the
+    # dip/catch phase. Linearly ramps from com_band_m to com_band_late_m
+    # for t ∈ [com_relax_t, 1]; equality (eq, no band) when com_band_m == 0
+    # AND the late band is also 0.
+    def com_band_at(k):
+        t = k / max(n_waypoints - 1, 1)
+        if t <= com_relax_t:
+            return com_band_m
+        s = (t - com_relax_t) / max(1.0 - com_relax_t, 1e-9)
+        return com_band_m + s * (com_band_late_m - com_band_m)
+
+    com_wps = (range(1, n_waypoints) if (pin_wp0 and start_state_deg is not None)
+               else range(n_waypoints))
+    use_eq = (com_band_m is None or com_band_m <= 0.0) and \
+             (com_band_late_m is None or com_band_late_m <= 0.0)
+    if use_eq:
+        for k in com_wps:
+            def make_com_eq(kk):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    cx, _g = compute_com_world_x_and_grad(X[kk], grip_is_right, bar1)
+                    return cx - bar1_x
+                def jac(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    _cx, g = compute_com_world_x_and_grad(X[kk], grip_is_right, bar1)
+                    J = np.zeros((n_waypoints, STATE_DIM))
+                    J[kk] = g
+                    return J.reshape(-1)
+                return con, jac
+            c, j = make_com_eq(k)
+            constraints.append({"type": "eq", "fun": c, "jac": j})
+    else:
+        for k in com_wps:
+            band = com_band_at(k)
+            def make_com_lo(kk, b=band):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    cx, _g = compute_com_world_x_and_grad(X[kk], grip_is_right, bar1)
+                    return cx - (bar1_x - b)
+                return con
+            def make_com_hi(kk, b=band):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    cx, _g = compute_com_world_x_and_grad(X[kk], grip_is_right, bar1)
+                    return (bar1_x + b) - cx
+                return con
+            constraints.append({"type": "ineq", "fun": make_com_lo(k)})
+            constraints.append({"type": "ineq", "fun": make_com_hi(k)})
+
+    # Final tip exactly at bar2 (both x and y).
+    def final_tip_x(x_flat):
+        X = x_flat.reshape(n_waypoints, STATE_DIM)
+        return float(free_tip(X[-1])[0] - bar2[0])
+
+    def final_tip_y(x_flat):
+        X = x_flat.reshape(n_waypoints, STATE_DIM)
+        return float(free_tip(X[-1])[1] - bar2[1])
+
+    constraints.append({"type": "eq", "fun": final_tip_x})
+    constraints.append({"type": "eq", "fun": final_tip_y})
+
+    # Monotone progress in free-hand x: prevent backtracking.
+    if monotone_x:
+        for k in range(n_waypoints - 1):
+            def make_mono(kk):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    return float(free_tip(X[kk + 1])[0] - free_tip(X[kk])[0])
+                return con
+            constraints.append({"type": "ineq", "fun": make_mono(k)})
+
+    # Bar clearance: gripper points up and catches bar2 from below, so the
+    # free-hand tip must stay at least `bar_clearance_m` below bar height
+    # at every waypoint except the catch. Forces the swing arc to dip
+    # under the bars instead of arcing over them.
+    if bar_clearance_m is not None and bar_clearance_m > 0.0:
+        for k in range(n_waypoints - 1):
+            def make_clearance(kk):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    return float((bar_y - bar_clearance_m) - free_tip(X[kk])[1])
+                return con
+            constraints.append({"type": "ineq", "fun": make_clearance(k)})
+
+    # Collision constraints — only the three pairs that matter in 3D:
+    #   1. Same-arm parallel link pair within the parallelogram
+    #      (Comp139 ∥ Comp148, Comp146 ∥ Comp147 — width 1.25" each).
+    #   2. Body line (between shoulders) vs bar1, bar2.
+    #   3. Each arm's links vs the body box hanging from the shoulders.
+    # Inter-arm collisions are not included: the 11.7" bilateral spacing
+    # makes them physically impossible.
+    if enable_collision:
+        d_link_link = 2.0 * LINK_RADIUS_M           # 1.25" (sum of half-widths)
+        d2_ll = d_link_link ** 2
+        d_body_bar = BAR_RADIUS_M + LINK_HALF_WIDTH_M  # body line ≈ link width
+        d2_body_bar = d_body_bar ** 2
+        d_arm_body = LINK_HALF_WIDTH_M             # arm capsule half-width
+        d2_arm_body = d_arm_body ** 2
+        bar1_pt = np.asarray(bar1, dtype=float)
+        bar2_pt = np.asarray(bar2, dtype=float)
+        body_height_m = 4.0 * INCH_TO_M             # body box height (~4")
+
+        def _body_box_corners(L):
+            """Return (top_left, top_right, bottom_left, bottom_right) in
+            world frame given the landmarks dict."""
+            gs = L["grip_shoulder"]; fs = L["free_shoulder"]
+            x_lo = min(gs[0], fs[0]); x_hi = max(gs[0], fs[0])
+            y_top = (gs[1] + fs[1]) / 2.0
+            y_bot = y_top - body_height_m
+            return (np.array([x_lo, y_top]), np.array([x_hi, y_top]),
+                    np.array([x_lo, y_bot]), np.array([x_hi, y_bot]))
+
+        for k in range(n_waypoints):
+            is_catch = (k == n_waypoints - 1)
+
+            # 1. Same-arm parallel link pairs — the two real parallelograms:
+            #    Comp139 (M1 → elbow)         ∥ Comp148 (M2 → J_purple)
+            #    Comp146 (elbow → J4 forearm) ∥ Comp147 (J_distal → J7)
+            # Both arms are checked. Parallelogram geometry keeps these
+            # parallel; the check enforces centre-line distance ≥ 1.25".
+            def make_parallel_pair(kk, arm, p1k, p2k, q1k, q2k):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    L = _arm_landmarks(X[kk], grip_is_right, bar1)
+                    d2 = _seg_seg_dist_sq(L[p1k], L[p2k], L[q1k], L[q2k])
+                    return float(d2 - d2_ll)
+                return con
+
+            for arm in ("grip", "free"):
+                # Comp139 (shoulder→elbow) ∥ Comp148 (M2→J_purple)
+                constraints.append({"type": "ineq",
+                                    "fun": make_parallel_pair(
+                                        k, arm,
+                                        f"{arm}_shoulder", f"{arm}_elbow",
+                                        f"{arm}_M2",       f"{arm}_J_purple")})
+                # Comp146 (elbow→J4) ∥ Comp147 (J_distal→J7)
+                constraints.append({"type": "ineq",
+                                    "fun": make_parallel_pair(
+                                        k, arm,
+                                        f"{arm}_elbow",    f"{arm}_J4",
+                                        f"{arm}_J_distal", f"{arm}_J7")})
+
+            # 2. Body line vs bars. The "body line" is the segment between
+            #    the two shoulders (top of the body box).
+            def make_body_vs_bar(kk, bar_pt):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    L = _arm_landmarks(X[kk], grip_is_right, bar1)
+                    d2 = _point_seg_dist_sq(bar_pt,
+                                             L["grip_shoulder"],
+                                             L["free_shoulder"])
+                    return float(d2 - d2_body_bar)
+                return con
+
+            constraints.append({"type": "ineq",
+                                "fun": make_body_vs_bar(k, bar1_pt)})
+            if not is_catch:
+                constraints.append({"type": "ineq",
+                                    "fun": make_body_vs_bar(k, bar2_pt)})
+
+            # 3. Arm vs body box. Each arm has 3 segments (upper, forearm,
+            #    wrist plate). The body box has 4 edges. Skip the upper-arm
+            #    constraint that's connected at the shoulder (zero distance
+            #    by construction). Check forearm and wrist-plate vs the
+            #    body box's four edges.
+            def make_seg_vs_body_edge(kk, arm, p_key, q_key, edge_idx):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    L = _arm_landmarks(X[kk], grip_is_right, bar1)
+                    tl, tr, bl, br = _body_box_corners(L)
+                    edges = [(tl, tr), (tr, br), (br, bl), (bl, tl)]
+                    e1, e2 = edges[edge_idx]
+                    d2 = _seg_seg_dist_sq(L[p_key], L[q_key], e1, e2)
+                    return float(d2 - d2_arm_body)
+                return con
+
+            for arm in ("grip", "free"):
+                for (p, q) in [(f"{arm}_elbow", f"{arm}_J4"),    # forearm
+                                (f"{arm}_J4",    f"{arm}_J7")]:    # wrist plate
+                    for edge_idx in range(4):
+                        constraints.append({
+                            "type": "ineq",
+                            "fun": make_seg_vs_body_edge(k, arm, p, q, edge_idx),
+                        })
+
+            # 4. Inter-arm collisions — the two arms must never intersect in
+            #    the swing plane, even though the bilateral spacing makes 3D
+            #    collision impossible. Disc treated as a horizontal line of
+            #    length 2*DISC_RADIUS at ee_base (perpendicular to the ee
+            #    line, as the user specified).
+            d2_disc_link = (LINK_HALF_WIDTH_M) ** 2
+            d2_disc_disc = (0.005) ** 2   # 5 mm minimum separation
+
+            def _disc_segment(L, side):
+                eb = L[f"{side}_disc"]
+                return (np.array([eb[0] - DISC_RADIUS_M, eb[1]]),
+                        np.array([eb[0] + DISC_RADIUS_M, eb[1]]))
+
+            def make_inter_seg(kk, fp1, fp2, gp1, gp2, thr_sq):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    L = _arm_landmarks(X[kk], grip_is_right, bar1)
+                    d2 = _seg_seg_dist_sq(L[fp1], L[fp2], L[gp1], L[gp2])
+                    return float(d2 - thr_sq)
+                return con
+
+            def make_inter_disc_seg(kk, disc_side, op1, op2, thr_sq):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    L = _arm_landmarks(X[kk], grip_is_right, bar1)
+                    da, db = _disc_segment(L, disc_side)
+                    d2 = _seg_seg_dist_sq(da, db, L[op1], L[op2])
+                    return float(d2 - thr_sq)
+                return con
+
+            def make_inter_disc_disc(kk, thr_sq):
+                def con(x_flat):
+                    X = x_flat.reshape(n_waypoints, STATE_DIM)
+                    L = _arm_landmarks(X[kk], grip_is_right, bar1)
+                    fa, fb = _disc_segment(L, "free")
+                    ga, gb = _disc_segment(L, "grip")
+                    d2 = _seg_seg_dist_sq(fa, fb, ga, gb)
+                    return float(d2 - thr_sq)
+                return con
+
+            # Link-vs-link pairs (forearm + upper, both arms)
+            link_pairs = [
+                ("free_shoulder", "free_elbow", "grip_shoulder", "grip_elbow"),
+                ("free_shoulder", "free_elbow", "grip_elbow",    "grip_J4"),
+                ("free_elbow",    "free_J4",    "grip_shoulder", "grip_elbow"),
+                ("free_elbow",    "free_J4",    "grip_elbow",    "grip_J4"),
+            ]
+            for (a, b, c, d) in link_pairs:
+                constraints.append({"type": "ineq",
+                                    "fun": make_inter_seg(k, a, b, c, d, d2_ll)})
+
+            # Disc-vs-other-arm-link pairs (disc as horizontal segment)
+            for disc_side, other in [("free", "grip"), ("grip", "free")]:
+                for (p, q) in [(f"{other}_shoulder", f"{other}_elbow"),
+                                (f"{other}_elbow",    f"{other}_J4"),
+                                (f"{other}_J4",       f"{other}_J7")]:
+                    constraints.append({
+                        "type": "ineq",
+                        "fun": make_inter_disc_seg(k, disc_side, p, q, d2_disc_link),
+                    })
+
+            # Disc-vs-disc (skip at catch — discs end up at the catch bar)
+            if not is_catch:
+                constraints.append({"type": "ineq",
+                                    "fun": make_inter_disc_disc(k, d2_disc_disc)})
+
+    print(f"[minimal] Optimising {n_waypoints} waypoints × {STATE_DIM} DOF "
+          f"= {n_waypoints * STATE_DIM} variables …")
+
+    result = minimize(
+        cost,
+        x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 500, "ftol": 1e-9, "disp": True},
+    )
+    print(f"[minimal] Optimiser exit: {result.message}  "
+          f"(success={result.success})")
+
+    X_opt = result.x.reshape(n_waypoints, STATE_DIM)
+
+    # Build infos to match plan_trajectory's output shape.
+    infos = []
+    for k in range(n_waypoints):
+        t1g, t2g, t1f, t2f, td = unpack_state(X_opt[k])
+        grip_sh = shoulder_from_bar(bar1, t1g, t2g,
+                                    grip_is_left=not grip_is_right)
+        _, free_sh = body_and_free_shoulder(grip_sh, grip_is_right)
+        fh = free_hand_world(free_sh, t1f, t2f, free_is_left=grip_is_right)
+        com_x, com_y = compute_com_world(t1g, t2g, t1f, t2f, td,
+                                         grip_is_right, bar1)
+        infos.append({
+            "grip_shoulder": grip_sh,
+            "free_shoulder": free_sh,
+            "free_hand": fh,
+            "free_gripper_tip": fh.copy(),
+            "com": np.array([com_x, com_y]),
+            "target": fh.copy(),
+            "state": X_opt[k].copy(),
+        })
+
+    return X_opt, infos, result
+
+
 # ── Visualisation ────────────────────────────────────────────────────────────
 
 def draw_robot_at_waypoint(ax, info, grip_is_right, L1, L2, alpha=1.0,
-                           bar_pos=None, show_meshes=False):
+                           bar_pos=None, show_meshes=False,
+                           show_widths=True):
     """Draw the full robot for one waypoint.
 
     Uses the Willy double-parallelogram arm style from the HTML visualizer.
     If show_meshes=True, also draws translucent convex hull outlines of
-    the actual STL meshes.
+    the actual STL meshes. If show_widths=True (default), overlays the
+    physical extents of each parallelogram link (1.25" wide), the triangle,
+    and the wrist-plate disc (4" diameter, edge-on).
     """
+    if show_widths:
+        # Filled polygons: link extents + triangle + disc.
+        from matplotlib.patches import Polygon as _MplPolygon
+        t1g, t2g, t1f, t2f, _td = unpack_state(info["state"])
+        gs = info["grip_shoulder"]
+        fs = info["free_shoulder"]
+        grip_is_left = not grip_is_right
+
+        def _draw_arm(t1, t2, sh, side_is_left, link_color, disc_color):
+            polys = arm_collision_polygons(t1, t2, sh, side_is_left)
+            for verts, kind in polys:
+                if kind == "triangle":
+                    face = link_color; ec = link_color
+                elif kind == "plate":
+                    face = link_color; ec = link_color
+                elif kind == "disc":
+                    face = disc_color; ec = disc_color
+                else:
+                    face = link_color; ec = link_color
+                p = _MplPolygon(verts, closed=True,
+                                facecolor=face, edgecolor=ec,
+                                alpha=0.18 * alpha, linewidth=0.6,
+                                zorder=1)
+                ax.add_patch(p)
+
+        _draw_arm(t1g, t2g, gs, grip_is_left,
+                  link_color="#5fb3ff", disc_color="#0891b2")
+        _draw_arm(t1f, t2f, fs, not grip_is_left,
+                  link_color="#ff9f5f", disc_color="#d97706")
+
     segments = get_robot_segments(info, grip_is_right, L1, L2, bar_pos=bar_pos)
 
     # Segment structure:
@@ -1336,6 +2014,126 @@ class WitIMU(IMUInterface):
         pass
 
 
+class InnerStabilizer:
+    """Fast inner-loop body-tilt stabilizer.
+
+    Runs at the motor command rate (200-500 Hz). Reads IMU tilt + rate,
+    computes a tail-angle correction with a PD law, and adds it to whatever
+    tail reference the planner provides. The outer planner / MPC stays
+    unchanged; this just rides on top of its commanded angles.
+
+    Sign convention: positive tilt = COM drifted to +x of the gripped bar
+    (see pendulum_tilt_angle). To restore, COM must move toward -x. Whether
+    that means increasing or decreasing the tail angle depends on the
+    tail's mass-offset geometry (see compute_com_world: increasing tail_gui
+    rotates the tail mass, shifting world COM_x). Default tail_sign=-1.0
+    assumes increasing tail moves world COM_x in +x; flip to +1.0 if your
+    geometry is mirrored.
+
+    Usage:
+        stab = InnerStabilizer(kp_deg_per_rad=30.0, kd_deg_s_per_rad=5.0)
+        ...
+        q_ref = controller.current_target_angles()
+        q_cmd = stab.apply(q_ref, imu.read(), dt=0.005)
+        send_to_motors(q_cmd)
+    """
+
+    def __init__(self,
+                 kp_deg_per_rad=30.0,
+                 kd_deg_s_per_rad=5.0,
+                 tail_sign=-1.0,
+                 max_correction_deg=20.0,
+                 tail_limits_deg=(-90.0, 90.0),
+                 tilt_lowpass_alpha=1.0,
+                 use_imu_rate=True):
+        self.kp = float(kp_deg_per_rad)
+        self.kd = float(kd_deg_s_per_rad)
+        self.tail_sign = float(tail_sign)
+        self.max_correction_deg = float(max_correction_deg)
+        self.tail_lo, self.tail_hi = (float(tail_limits_deg[0]),
+                                      float(tail_limits_deg[1]))
+        self.alpha = float(tilt_lowpass_alpha)
+        self.use_imu_rate = bool(use_imu_rate)
+
+        self._tilt_filt_rad = None
+        self._prev_tilt_rad = None
+        self._last_correction_deg = 0.0
+        self._last_tilt_err_rad = 0.0
+        self._last_rate_rad_s = 0.0
+
+    def reset(self):
+        self._tilt_filt_rad = None
+        self._prev_tilt_rad = None
+        self._last_correction_deg = 0.0
+        self._last_tilt_err_rad = 0.0
+        self._last_rate_rad_s = 0.0
+
+    def apply(self, q_ref, imu_reading, dt=None, tilt_ref_rad=0.0):
+        """Return a corrected joint-angle dict.
+
+        q_ref: dict from ReplanningController.current_target_angles().
+               Must contain key 'tail_gui_deg'. Other joints pass through
+               unchanged.
+        imu_reading: IMUReading. Uses tilt_rad and (optionally)
+               tilt_rate_rad_s.
+        dt: timestep in seconds. Required when use_imu_rate=False so the
+            stabilizer can finite-difference the tilt itself.
+        tilt_ref_rad: reference tilt (rad). Set to 0 for the static-reach
+            plan; pass the planner's expected tilt if you want the
+            stabilizer to track a swinging reference.
+        """
+        tilt = float(imu_reading.tilt_rad)
+
+        # Optional first-order low-pass to suppress IMU noise.
+        if self._tilt_filt_rad is None:
+            self._tilt_filt_rad = tilt
+        else:
+            self._tilt_filt_rad = (self.alpha * tilt
+                                   + (1.0 - self.alpha) * self._tilt_filt_rad)
+        tilt_used = self._tilt_filt_rad
+
+        if self.use_imu_rate:
+            rate = float(imu_reading.tilt_rate_rad_s)
+        else:
+            if self._prev_tilt_rad is None or dt is None or dt <= 0.0:
+                rate = 0.0
+            else:
+                rate = (tilt_used - self._prev_tilt_rad) / float(dt)
+        self._prev_tilt_rad = tilt_used
+
+        tilt_err = tilt_used - float(tilt_ref_rad)
+        delta_tail_deg = self.tail_sign * (self.kp * tilt_err
+                                            + self.kd * rate)
+
+        # Clamp correction magnitude so a single spike can't slam the tail.
+        if delta_tail_deg > self.max_correction_deg:
+            delta_tail_deg = self.max_correction_deg
+        elif delta_tail_deg < -self.max_correction_deg:
+            delta_tail_deg = -self.max_correction_deg
+
+        out = dict(q_ref)
+        tail_ref = float(out.get("tail_gui_deg", 0.0))
+        tail_cmd = tail_ref + delta_tail_deg
+        if tail_cmd < self.tail_lo:
+            tail_cmd = self.tail_lo
+        elif tail_cmd > self.tail_hi:
+            tail_cmd = self.tail_hi
+        out["tail_gui_deg"] = tail_cmd
+
+        self._last_correction_deg = delta_tail_deg
+        self._last_tilt_err_rad = tilt_err
+        self._last_rate_rad_s = rate
+        return out
+
+    def diagnostics(self):
+        """Return last-step diagnostics for logging / plotting."""
+        return {
+            "tilt_err_deg": math.degrees(self._last_tilt_err_rad),
+            "tilt_rate_deg_s": math.degrees(self._last_rate_rad_s),
+            "tail_correction_deg": self._last_correction_deg,
+        }
+
+
 class ReplanningController:
     """Closed-loop trajectory controller that replans when IMU tilt
     diverges from the planned trajectory.
@@ -1384,10 +2182,12 @@ class ReplanningController:
         # trajectory shape (arc under bar1 then up to bar2) consistent.
         self.anchor = None
         self.anchor_idx = 0
-        # Current measured IMU tilt (rad). The QP's COM and goal constraints
-        # apply rotation by this angle around bar1 so the planner picks a
-        # joint config whose RENDERED-IN-WORLD COM lies under bar1 (and whose
-        # rendered tip lands at bar2). Updated each step before replanning.
+        # Current measured IMU tilt (rad), updated each step before replanning.
+        # Passed to QPReplanner.replan() via current_tilt_rad. The goal
+        # constraint rotates the body-frame tip by this angle around bar1 so
+        # the QP picks a final joint config whose rendered (in-world) tip
+        # lands on bar2. The COM constraint stays in body frame on purpose
+        # (gravity restores tilt when the commanded body-COM is at bar1).
         self.current_imu_tilt_rad = 0.0
 
         self.trajectory = None   # (n_waypoints, STATE_DIM) array
@@ -1540,7 +2340,10 @@ class ReplanningController:
         bar1 = np.array([self.bar1_x, self.bar_y])
         grip_is_right = self.grip_is_right
 
-        def eval_fn(state_rad, _bar1=bar1, _gir=grip_is_right):
+        def eval_fn(state_rad, tilt_rad=0.0, _bar1=bar1, _gir=grip_is_right):
+            # COM constraint stays in body frame regardless of tilt — see
+            # docstring above. tilt_rad accepted for API uniformity.
+            del tilt_rad  # intentionally unused
             return compute_com_world_x_and_grad(state_rad, _gir, _bar1)
 
         return {
@@ -1559,7 +2362,6 @@ class ReplanningController:
         target_xy = np.array([self.bar2_x, self.bar_y])
         grip_is_right = self.grip_is_right
         eps = math.radians(0.05)
-        ctrl = self
 
         def _free_tip_plan(state_rad):
             t1g = math.degrees(state_rad[0]); t2g = math.degrees(state_rad[1])
@@ -1575,9 +2377,12 @@ class ReplanningController:
             return np.array([bar1[0] + dx * cos_t - dy * sin_t,
                              bar1[1] + dx * sin_t + dy * cos_t])
 
-        def eval_fn(state_rad, _eps=eps):
-            theta = ctrl.current_imu_tilt_rad
-            cos_t = math.cos(theta); sin_t = math.sin(theta)
+        def eval_fn(state_rad, tilt_rad=0.0, _eps=eps):
+            # Rotate the body-frame tip by the explicitly-supplied IMU
+            # tilt around bar1 to get its world-frame position. This is
+            # the critical bit: the QP picks a final joint config whose
+            # RENDERED tip (after the body has tilted) lands on bar2.
+            cos_t = math.cos(tilt_rad); sin_t = math.sin(tilt_rad)
             tip_p0 = _free_tip_plan(state_rad)
             tip_w0 = _rotate_around_bar1(tip_p0, cos_t, sin_t)
             J = np.zeros((2, STATE_DIM), dtype=float)
@@ -1593,7 +2398,10 @@ class ReplanningController:
 
     def _qp_replan(self, x_ref, current_state_rad):
         """Sub-millisecond OSQP-based replan. Tracks `x_ref`, or, if
-        `self.anchor` is set, a sliding window into the anchor trajectory."""
+        `self.anchor` is set, a sliding window into the anchor trajectory.
+        Passes the latest measured IMU tilt explicitly to the replanner so
+        the goal constraint enforces the rendered (in-world) tip on bar2.
+        """
         from qp_replanner import QPReplanner
         n = x_ref.shape[0]
         # Sliding-window anchor reference (keeps the arc shape stable).
@@ -1613,7 +2421,10 @@ class ReplanningController:
                 goal_constraint=self._make_goal_constraint() if n >= 2 else None,
             )
             self._qp_replanners[n] = replanner
-        X_new, status = replanner.replan(x_ref, current_state_rad)
+        X_new, status = replanner.replan(
+            x_ref, current_state_rad,
+            current_tilt_rad=float(self.current_imu_tilt_rad),
+        )
         self._last_qp_solve_ms = replanner.last_solve_ms
         return X_new, status
 
@@ -3181,6 +3992,31 @@ def main():
                         help="Wall-clock seconds per replan iteration (default 0.1)")
     parser.add_argument("--mpc-viz-fps", type=float, default=20.0,
                         help="Animation FPS for --mpc-viz (default 20)")
+    parser.add_argument("--minimal", action="store_true",
+                        help="Use plan_trajectory_minimal: no hand-crafted "
+                             "arc, tail unlocked, COM hard-equality.")
+    parser.add_argument("--tail-min", type=float, default=-60.0,
+                        help="Tail GUI angle lower limit (deg, --minimal only)")
+    parser.add_argument("--tail-max", type=float, default=60.0,
+                        help="Tail GUI angle upper limit (deg, --minimal only)")
+    parser.add_argument("--dip-depth", type=float, default=0.10,
+                        help="Peak dip depth in m below bar (default 0.10)")
+    parser.add_argument("--dip-skew", type=float, default=4.0,
+                        help="Dip skew k: >1 pushes dip peak late "
+                             "(default 4.0, peak at t≈0.84)")
+    parser.add_argument("--com-band", type=float, default=0.03,
+                        help="|COM_x - bar1_x| during direct phase (m)")
+    parser.add_argument("--com-band-late", type=float, default=0.05,
+                        help="|COM_x - bar1_x| during dip/catch phase (m)")
+    parser.add_argument("--no-collision", action="store_true",
+                        help="Disable geometric collision constraints "
+                             "(--minimal only)")
+    parser.add_argument("--com-relax-t", type=float, default=0.70,
+                        help="t at which COM band starts widening (0..1)")
+    parser.add_argument("--bar-clearance", type=float, default=0.02,
+                        help="Min clearance below bar in m (except at catch)")
+    parser.add_argument("--track-weight", type=float, default=20.0,
+                        help="Soft tracking cost on Cartesian U-target")
     parser.add_argument("--mpc-viz-advance", type=int, default=4,
                         help="How many waypoints of the fresh plan to advance "
                              "per iter (default 4). Higher = faster progress "
@@ -3338,14 +4174,31 @@ def main():
     print(f"COM tolerance: ±{args.com_tol*100:.1f} cm")
     print()
 
-    X_opt, infos, result = plan_trajectory(
-        bar1_x, bar2_x, bar_y,
-        grip_is_right=grip_is_right,
-        n_waypoints=args.n_waypoints,
-        com_tolerance=args.com_tol,
-        smoothness_weight=args.smoothness,
-        reach_weight=args.reach_weight,
-    )
+    if args.minimal:
+        X_opt, infos, result = plan_trajectory_minimal(
+            bar1_x, bar2_x, bar_y,
+            grip_is_right=grip_is_right,
+            n_waypoints=args.n_waypoints,
+            tail_lim=(args.tail_min, args.tail_max),
+            smoothness_weight=args.smoothness,
+            dip_depth_m=args.dip_depth,
+            dip_skew_k=args.dip_skew,
+            com_band_m=args.com_band,
+            com_band_late_m=args.com_band_late,
+            com_relax_t=args.com_relax_t,
+            bar_clearance_m=args.bar_clearance,
+            track_weight=args.track_weight,
+            enable_collision=not args.no_collision,
+        )
+    else:
+        X_opt, infos, result = plan_trajectory(
+            bar1_x, bar2_x, bar_y,
+            grip_is_right=grip_is_right,
+            n_waypoints=args.n_waypoints,
+            com_tolerance=args.com_tol,
+            smoothness_weight=args.smoothness,
+            reach_weight=args.reach_weight,
+        )
 
     # Print summary
     print("\n── Trajectory summary ──")

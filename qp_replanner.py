@@ -39,6 +39,19 @@ import scipy.sparse as sp
 STATE_DIM = 5
 
 
+def _call_eval(fn, state_rad, tilt_rad):
+    """Call an eval_fn that may take 1 or 2 positional args.
+
+    Older eval_fns accept just `state_rad`; newer ones take
+    `(state_rad, tilt_rad)` so they can rotate body-frame kinematics
+    into world frame around bar1. This shim accepts both.
+    """
+    try:
+        return fn(state_rad, tilt_rad)
+    except TypeError:
+        return fn(state_rad)
+
+
 def _smoothness_dt_d(n_waypoints):
     """D such that D x stacks the consecutive differences x[k+1]-x[k]."""
     nx = n_waypoints * STATE_DIM
@@ -239,8 +252,16 @@ class QPReplanner:
         self._last_com_eval_ms = 0.0
         self._last_max_slack = 0.0
 
-    def replan(self, x_ref, current_state_rad):
-        """Solve one QP. Returns ((n_waypoints, STATE_DIM), status_str)."""
+    def replan(self, x_ref, current_state_rad, current_tilt_rad=0.0):
+        """Solve one QP. Returns ((n_waypoints, STATE_DIM), status_str).
+
+        current_tilt_rad: latest IMU tilt (body angle from vertical, +CW).
+            Passed through to the COM and goal eval_fn callbacks as the
+            second positional argument so they can rotate body-frame
+            kinematics into world frame around bar1. Eval_fns may ignore
+            it (the COM eval_fn intentionally stays in body frame; the
+            goal eval_fn rotates by it).
+        """
         x_ref = np.asarray(x_ref, dtype=float)
         if x_ref.shape != (self.n_waypoints, STATE_DIM):
             raise ValueError(
@@ -281,7 +302,8 @@ class QPReplanner:
             grad_pos = self._com_grad_pos_in_Ax
             for kk in range(self._n_com):
                 wp = kk + 1   # waypoint index (skip WP 0)
-                com_x_ref_k, grad_k = eval_fn(x_ref[wp])
+                com_x_ref_k, grad_k = _call_eval(eval_fn, x_ref[wp],
+                                                  current_tilt_rad)
                 grad_dot = float(np.dot(grad_k, x_ref[wp]))
                 # Linearised band:
                 #   grad·x ∈ [com_lo - com_x_ref_k + grad·x_ref,
@@ -307,7 +329,7 @@ class QPReplanner:
             target_xy = np.asarray(self.goal_constraint["target_xy"], dtype=float)
             eval_fn = self.goal_constraint["eval_fn"]
             x_last = x_ref[-1]
-            tip_xy_ref, J = eval_fn(x_last)
+            tip_xy_ref, J = _call_eval(eval_fn, x_last, current_tilt_rad)
             tip_xy_ref = np.asarray(tip_xy_ref, dtype=float).flatten()
             J = np.asarray(J, dtype=float)
             # Linearise: tip(x_last) ≈ tip_ref + J · (x_last - x_ref_last)
