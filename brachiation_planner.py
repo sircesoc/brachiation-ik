@@ -627,12 +627,12 @@ _COMP_L1_IN          = 3.4
 _COMP_L2_IN          = 11.8
 _COMP_BPO_IN         = 5.99606299
 _COMP_M_BODY         = 9.68960433
-_COMP_M_TAIL         = 3.9471154
+_COMP_M_TAIL         = 3.7882
 _COMP_M_LINK1        = 2.78627841
 _COMP_M_LINK2        = 1.16620275
 _COMP_M_GRIPPER      = 4.08915
 _COMP_X_GRIP_OFF_IN  = 0.37758314
-_COMP_TAIL_OFF_IN    = 15.3379
+_COMP_TAIL_OFF_IN    = 14.42146235
 _COMP_TAIL_STOP_RAD  = math.radians(8.73)
 # Polynomial fits for link-2 mass-offset, in DEGREES → inches.
 _COMP_AX = (0.0, -0.0001699867194, 0.03098551081, -0.1653118738)        # cubic→constant for x-offset
